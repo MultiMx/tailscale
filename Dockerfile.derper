@@ -11,8 +11,7 @@ RUN apk update && \
 
 COPY /${TARGETOS}/${TARGETARCH}/runner /usr/bin/runner
 
-RUN chmod +x /usr/bin/runner && \
-    setcap 'cap_net_bind_service=+ep' /usr/bin/runner
+RUN chmod +x /usr/bin/runner
 
 WORKDIR /data
 
