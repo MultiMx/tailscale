@@ -1,4 +1,6 @@
 FROM alpine:latest
+ARG TARGETOS
+ARG TARGETARCH
 
 RUN apk update && \
     apk upgrade --no-cache && \
@@ -7,7 +9,7 @@ RUN apk update && \
     echo 'Asia/Shanghai' >/etc/timezone && \
     rm -rf /var/cache/apk/*
 
-COPY ./runner /usr/bin/runner
+COPY /${TARGETOS}/${TARGETARCH}/runner /usr/bin/runner
 
 RUN chmod +x /usr/bin/runner && \
     setcap 'cap_net_bind_service=+ep' /usr/bin/runner
