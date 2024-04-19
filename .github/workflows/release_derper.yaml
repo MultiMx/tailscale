@@ -1,0 +1,23 @@
+name: Release Derper
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  Release:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Build Binary
+        env:
+          CGO_ENABLED: 0
+        run: go build -gcflags=-trimpath=$GOPATH -asmflags=-trimpath=$GOPATH -ldflags '-extldflags "-static -fpic" -s -w' -o runner ./cmd/derper
+
+      - name: Build and Push the Docker image
+        run: |
+          docker build . --file Dockerfile.derper --tag mmx233/derper
+          docker push mmx233/derper
