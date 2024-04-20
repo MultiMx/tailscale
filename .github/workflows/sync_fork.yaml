@@ -16,4 +16,4 @@ jobs:
           owner: tailscale
           base: main
           head: main
-          token: ${{ PERSONAL_TOKEN }}
+          token: ${{ secrets.PERSONAL_TOKEN }}
