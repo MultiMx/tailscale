@@ -586,10 +586,12 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	c.logf("RegisterReq: onode=%v node=%v fup=%v nks=%v",
 		request.OldNodeKey.ShortString(),
 		request.NodeKey.ShortString(), opt.URL != "", len(nodeKeySignature) > 0)
-	request.Auth.Oauth2Token = opt.Token
-	request.Auth.Provider = persist.Provider
-	request.Auth.LoginName = persist.UserProfile.LoginName
-	request.Auth.AuthKey = authKey
+	if opt.Token != nil || authKey != "" {
+		request.Auth = &tailcfg.RegisterResponseAuth{
+			Oauth2Token: opt.Token,
+			AuthKey:     authKey,
+		}
+	}
 	err = signRegisterRequest(&request, c.serverURL, c.serverLegacyKey, machinePrivKey.Public())
 	if err != nil {
 		// If signing failed, clear all related fields
@@ -668,9 +670,6 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		c.logf("server reports new node key %v has expired",
 			request.NodeKey.ShortString())
 		return true, "", nil, nil
-	}
-	if resp.Login.Provider != "" {
-		persist.Provider = resp.Login.Provider
 	}
 	persist.UserProfile = tailcfg.UserProfile{
 		ID:            resp.User.ID,

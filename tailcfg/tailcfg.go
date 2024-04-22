@@ -1069,10 +1069,11 @@ func (st SignatureType) String() string {
 // in response to a RegisterRequest.
 type RegisterResponseAuth struct {
 	_ structs.Incomparable
-	// One of Provider/LoginName, Oauth2Token, or AuthKey is set.
-	Provider, LoginName string
-	Oauth2Token         *Oauth2Token
-	AuthKey             string
+
+	// At most one of Oauth2Token or AuthKey is set.
+
+	Oauth2Token *Oauth2Token `json:",omitempty"`
+	AuthKey     string       `json:",omitempty"`
 }
 
 // RegisterRequest is sent by a client to register the key for a node.
@@ -1093,7 +1094,7 @@ type RegisterRequest struct {
 	NodeKey    key.NodePublic
 	OldNodeKey key.NodePublic
 	NLKey      key.NLPublic
-	Auth       RegisterResponseAuth
+	Auth       *RegisterResponseAuth `json:",omitempty"`
 	// Expiry optionally specifies the requested key expiry.
 	// The server policy may override.
 	// As a special case, if Expiry is in the past and NodeKey is
