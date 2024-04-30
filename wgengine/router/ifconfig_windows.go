@@ -20,7 +20,7 @@ import (
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 	"tailscale.com/health"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tstun"
 	"tailscale.com/util/multierr"
@@ -110,7 +110,7 @@ func monitorDefaultRoutes(tun *tun.NativeTun) (*winipcfg.RouteChangeCallback, er
 }
 
 func getDefaultRouteMTU() (uint32, error) {
-	mtus, err := interfaces.NonTailscaleMTUs()
+	mtus, err := netmon.NonTailscaleMTUs()
 	if err != nil {
 		return 0, err
 	}
@@ -237,7 +237,7 @@ func interfaceFromLUID(luid winipcfg.LUID, flags winipcfg.GAAFlags) (*winipcfg.I
 
 var networkCategoryWarning = health.NewWarnable(health.WithMapDebugFlag("warn-network-category-unhealthy"))
 
-func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
+func configureInterface(cfg *Config, tun *tun.NativeTun, health *health.Tracker) (retErr error) {
 	var mtu = tstun.DefaultTUNMTU()
 	luid := winipcfg.LUID(tun.LUID())
 	iface, err := interfaceFromLUID(luid,
@@ -268,10 +268,10 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
 		for i := range tries {
 			found, err := setPrivateNetwork(luid)
 			if err != nil {
-				networkCategoryWarning.Set(fmt.Errorf("set-network-category: %w", err))
+				health.SetWarnable(networkCategoryWarning, fmt.Errorf("set-network-category: %w", err))
 				log.Printf("setPrivateNetwork(try=%d): %v", i, err)
 			} else {
-				networkCategoryWarning.Set(nil)
+				health.SetWarnable(networkCategoryWarning, nil)
 				if found {
 					if i > 0 {
 						log.Printf("setPrivateNetwork(try=%d): success", i)

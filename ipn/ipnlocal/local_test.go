@@ -31,8 +31,8 @@ import (
 	"tailscale.com/drive/driveimpl"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
-	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
@@ -53,6 +53,8 @@ import (
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/wgcfg"
 )
+
+func fakeStoreRoutes(*appc.RouteInfo) error { return nil }
 
 func inRemove(ip netip.Addr) bool {
 	for _, pfx := range removeFromDefaultRoute {
@@ -602,7 +604,7 @@ func TestFileTargets(t *testing.T) {
 
 func TestInternalAndExternalInterfaces(t *testing.T) {
 	type interfacePrefix struct {
-		i   interfaces.Interface
+		i   netmon.Interface
 		pfx netip.Prefix
 	}
 
@@ -612,7 +614,7 @@ func TestInternalAndExternalInterfaces(t *testing.T) {
 		}
 		return pfxs
 	}
-	iList := func(ips ...interfacePrefix) (il interfaces.List) {
+	iList := func(ips ...interfacePrefix) (il netmon.InterfaceList) {
 		for _, ip := range ips {
 			il = append(il, ip.i)
 		}
@@ -620,7 +622,7 @@ func TestInternalAndExternalInterfaces(t *testing.T) {
 	}
 	newInterface := func(name, pfx string, wsl2, loopback bool) interfacePrefix {
 		ippfx := netip.MustParsePrefix(pfx)
-		ip := interfaces.Interface{
+		ip := netmon.Interface{
 			Interface: &net.Interface{},
 			AltAddrs: []net.Addr{
 				netipx.PrefixIPNet(ippfx),
@@ -644,7 +646,7 @@ func TestInternalAndExternalInterfaces(t *testing.T) {
 	tests := []struct {
 		name    string
 		goos    string
-		il      interfaces.List
+		il      netmon.InterfaceList
 		wantInt []netip.Prefix
 		wantExt []netip.Prefix
 	}{
@@ -1290,13 +1292,19 @@ func TestDNSConfigForNetmapForExitNodeConfigs(t *testing.T) {
 }
 
 func TestOfferingAppConnector(t *testing.T) {
-	b := newTestBackend(t)
-	if b.OfferingAppConnector() {
-		t.Fatal("unexpected offering app connector")
-	}
-	b.appConnector = appc.NewAppConnector(t.Logf, nil)
-	if !b.OfferingAppConnector() {
-		t.Fatal("unexpected not offering app connector")
+	for _, shouldStore := range []bool{false, true} {
+		b := newTestBackend(t)
+		if b.OfferingAppConnector() {
+			t.Fatal("unexpected offering app connector")
+		}
+		if shouldStore {
+			b.appConnector = appc.NewAppConnector(t.Logf, nil, &appc.RouteInfo{}, fakeStoreRoutes)
+		} else {
+			b.appConnector = appc.NewAppConnector(t.Logf, nil, nil, nil)
+		}
+		if !b.OfferingAppConnector() {
+			t.Fatal("unexpected not offering app connector")
+		}
 	}
 }
 
@@ -1341,21 +1349,27 @@ func TestRouterAdvertiserIgnoresContainedRoutes(t *testing.T) {
 }
 
 func TestObserveDNSResponse(t *testing.T) {
-	b := newTestBackend(t)
+	for _, shouldStore := range []bool{false, true} {
+		b := newTestBackend(t)
 
-	// ensure no error when no app connector is configured
-	b.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
+		// ensure no error when no app connector is configured
+		b.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
 
-	rc := &appctest.RouteCollector{}
-	b.appConnector = appc.NewAppConnector(t.Logf, rc)
-	b.appConnector.UpdateDomains([]string{"example.com"})
-	b.appConnector.Wait(context.Background())
+		rc := &appctest.RouteCollector{}
+		if shouldStore {
+			b.appConnector = appc.NewAppConnector(t.Logf, rc, &appc.RouteInfo{}, fakeStoreRoutes)
+		} else {
+			b.appConnector = appc.NewAppConnector(t.Logf, rc, nil, nil)
+		}
+		b.appConnector.UpdateDomains([]string{"example.com"})
+		b.appConnector.Wait(context.Background())
 
-	b.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
-	b.appConnector.Wait(context.Background())
-	wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
-	if !slices.Equal(rc.Routes(), wantRoutes) {
-		t.Fatalf("got routes %v, want %v", rc.Routes(), wantRoutes)
+		b.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
+		b.appConnector.Wait(context.Background())
+		wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
+		if !slices.Equal(rc.Routes(), wantRoutes) {
+			t.Fatalf("got routes %v, want %v", rc.Routes(), wantRoutes)
+		}
 	}
 }
 
@@ -1568,6 +1582,11 @@ func (h *errorSyspolicyHandler) ReadBoolean(key string) (bool, error) {
 	return false, syspolicy.ErrNoSuchKey
 }
 
+func (h *errorSyspolicyHandler) ReadStringArray(key string) ([]string, error) {
+	h.t.Errorf("ReadStringArray(%q) unexpectedly called", key)
+	return nil, syspolicy.ErrNoSuchKey
+}
+
 type mockSyspolicyHandler struct {
 	t *testing.T
 	// stringPolicies is the collection of policies that we expect to see
@@ -1605,6 +1624,13 @@ func (h *mockSyspolicyHandler) ReadBoolean(key string) (bool, error) {
 		h.t.Errorf("ReadBoolean(%q) unexpectedly called", key)
 	}
 	return false, syspolicy.ErrNoSuchKey
+}
+
+func (h *mockSyspolicyHandler) ReadStringArray(key string) ([]string, error) {
+	if h.failUnknownPolicies {
+		h.t.Errorf("ReadStringArray(%q) unexpectedly called", key)
+	}
+	return nil, syspolicy.ErrNoSuchKey
 }
 
 func TestSetExitNodeIDPolicy(t *testing.T) {
@@ -2257,7 +2283,6 @@ func TestPreferencePolicyInfo(t *testing.T) {
 
 func TestOnTailnetDefaultAutoUpdate(t *testing.T) {
 	tests := []struct {
-		desc           string
 		before, after  opt.Bool
 		tailnetDefault bool
 	}{
@@ -2293,7 +2318,7 @@ func TestOnTailnetDefaultAutoUpdate(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("before=%s after=%s", tt.before, tt.after), func(t *testing.T) {
+		t.Run(fmt.Sprintf("before=%s,after=%s", tt.before, tt.after), func(t *testing.T) {
 			b := newTestBackend(t)
 			p := ipn.NewPrefs()
 			p.AutoUpdate.Apply = tt.before
@@ -2301,7 +2326,14 @@ func TestOnTailnetDefaultAutoUpdate(t *testing.T) {
 				t.Fatal(err)
 			}
 			b.onTailnetDefaultAutoUpdate(tt.tailnetDefault)
-			if want, got := tt.after, b.pm.CurrentPrefs().AutoUpdate().Apply; got != want {
+			want := tt.after
+			// On platforms that don't support auto-update we can never
+			// transition to auto-updates being enabled. The value should
+			// remain unchanged after onTailnetDefaultAutoUpdate.
+			if !clientupdate.CanAutoUpdate() && want.EqualBool(true) {
+				want = tt.before
+			}
+			if got := b.pm.CurrentPrefs().AutoUpdate().Apply; got != want {
 				t.Errorf("got: %q, want %q", got, want)
 			}
 		})
@@ -3437,5 +3469,68 @@ func TestEnableAutoUpdates(t *testing.T) {
 		},
 	}); err != nil {
 		t.Fatalf("disabling auto-updates: got error: %v", err)
+	}
+}
+
+func TestReadWriteRouteInfo(t *testing.T) {
+	// set up a backend with more than one profile
+	b := newTestBackend(t)
+	prof1 := ipn.LoginProfile{ID: "id1", Key: "key1"}
+	prof2 := ipn.LoginProfile{ID: "id2", Key: "key2"}
+	b.pm.knownProfiles["id1"] = &prof1
+	b.pm.knownProfiles["id2"] = &prof2
+	b.pm.currentProfile = &prof1
+
+	// set up routeInfo
+	ri1 := &appc.RouteInfo{}
+	ri1.Wildcards = []string{"1"}
+
+	ri2 := &appc.RouteInfo{}
+	ri2.Wildcards = []string{"2"}
+
+	// read before write
+	readRi, err := b.readRouteInfoLocked()
+	if readRi != nil {
+		t.Fatalf("read before writing: want nil, got %v", readRi)
+	}
+	if err != ipn.ErrStateNotExist {
+		t.Fatalf("read before writing: want %v, got %v", ipn.ErrStateNotExist, err)
+	}
+
+	// write the first routeInfo
+	if err := b.storeRouteInfo(ri1); err != nil {
+		t.Fatal(err)
+	}
+
+	// write the other routeInfo as the other profile
+	if err := b.pm.SwitchProfile("id2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.storeRouteInfo(ri2); err != nil {
+		t.Fatal(err)
+	}
+
+	// read the routeInfo of the first profile
+	if err := b.pm.SwitchProfile("id1"); err != nil {
+		t.Fatal(err)
+	}
+	readRi, err = b.readRouteInfoLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(readRi.Wildcards, ri1.Wildcards) {
+		t.Fatalf("read prof1 routeInfo wildcards:  want %v, got %v", ri1.Wildcards, readRi.Wildcards)
+	}
+
+	// read the routeInfo of the second profile
+	if err := b.pm.SwitchProfile("id2"); err != nil {
+		t.Fatal(err)
+	}
+	readRi, err = b.readRouteInfoLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(readRi.Wildcards, ri2.Wildcards) {
+		t.Fatalf("read prof2 routeInfo wildcards:  want %v, got %v", ri2.Wildcards, readRi.Wildcards)
 	}
 }

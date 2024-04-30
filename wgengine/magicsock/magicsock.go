@@ -33,7 +33,6 @@ import (
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/connstats"
-	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netcheck"
 	"tailscale.com/net/neterror"
 	"tailscale.com/net/netmon"
@@ -90,7 +89,8 @@ type Conn struct {
 	idleFunc               func() time.Duration // nil means unknown
 	testOnlyPacketListener nettype.PacketListener
 	noteRecvActivity       func(key.NodePublic) // or nil, see Options.NoteRecvActivity
-	netMon                 *netmon.Monitor      // or nil
+	netMon                 *netmon.Monitor      // must be non-nil
+	health                 *health.Tracker      // or nil
 	controlKnobs           *controlknobs.Knobs  // or nil
 
 	// ================================================================
@@ -369,8 +369,12 @@ type Options struct {
 	NoteRecvActivity func(key.NodePublic)
 
 	// NetMon is the network monitor to use.
-	// With one, the portmapper won't be used.
+	// It must be non-nil.
 	NetMon *netmon.Monitor
+
+	// HealthTracker optionally specifies the health tracker to
+	// report errors and warnings to.
+	HealthTracker *health.Tracker
 
 	// ControlKnobs are the set of control knobs to use.
 	// If nil, they're ignored and not updated.
@@ -446,6 +450,10 @@ func newConn() *Conn {
 // As the set of possible endpoints for a Conn changes, the
 // callback opts.EndpointsFunc is called.
 func NewConn(opts Options) (*Conn, error) {
+	if opts.NetMon == nil {
+		return nil, errors.New("magicsock.Options.NetMon must be non-nil")
+	}
+
 	c := newConn()
 	c.port.Store(uint32(opts.Port))
 	c.controlKnobs = opts.ControlKnobs
@@ -459,10 +467,9 @@ func NewConn(opts Options) (*Conn, error) {
 		DisableAll: func() bool { return opts.DisablePortMapper || c.onlyTCP443.Load() },
 	}
 	c.portMapper = portmapper.NewClient(logger.WithPrefix(c.logf, "portmapper: "), opts.NetMon, portMapOpts, opts.ControlKnobs, c.onPortMapChanged)
-	if opts.NetMon != nil {
-		c.portMapper.SetGatewayLookupFunc(opts.NetMon.GatewayAndSelfIP)
-	}
+	c.portMapper.SetGatewayLookupFunc(opts.NetMon.GatewayAndSelfIP)
 	c.netMon = opts.NetMon
+	c.health = opts.HealthTracker
 	c.onPortUpdate = opts.OnPortUpdate
 	c.getPeerByKey = opts.PeerByKeyFunc
 
@@ -666,7 +673,7 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 		// NOTE(andrew-d): I don't love that we're depending on the
 		// health package here, but I'd rather do that and not store
 		// the exact same state in two different places.
-		GetLastDERPActivity: health.GetDERPRegionReceivedTime,
+		GetLastDERPActivity: c.health.GetDERPRegionReceivedTime,
 	})
 	if err != nil {
 		return nil, err
@@ -928,7 +935,7 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 	eps = c.endpointTracker.update(time.Now(), eps)
 
 	if localAddr := c.pconn4.LocalAddr(); localAddr.IP.IsUnspecified() {
-		ips, loopback, err := interfaces.LocalAddresses()
+		ips, loopback, err := netmon.LocalAddresses()
 		if err != nil {
 			return nil, err
 		}
@@ -1197,12 +1204,12 @@ func (c *Conn) putReceiveBatch(batch *receiveBatch) {
 
 // receiveIPv4 creates an IPv4 ReceiveFunc reading from c.pconn4.
 func (c *Conn) receiveIPv4() conn.ReceiveFunc {
-	return c.mkReceiveFunc(&c.pconn4, &health.ReceiveIPv4, metricRecvDataIPv4)
+	return c.mkReceiveFunc(&c.pconn4, c.health.ReceiveFuncStats(health.ReceiveIPv4), metricRecvDataIPv4)
 }
 
 // receiveIPv6 creates an IPv6 ReceiveFunc reading from c.pconn6.
 func (c *Conn) receiveIPv6() conn.ReceiveFunc {
-	return c.mkReceiveFunc(&c.pconn6, &health.ReceiveIPv6, metricRecvDataIPv6)
+	return c.mkReceiveFunc(&c.pconn6, c.health.ReceiveFuncStats(health.ReceiveIPv6), metricRecvDataIPv6)
 }
 
 // mkReceiveFunc creates a ReceiveFunc reading from ruc.
@@ -2471,7 +2478,7 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 		}
 		ruc.setConnLocked(pconn, network, c.bind.BatchSize())
 		if network == "udp4" {
-			health.SetUDP4Unbound(false)
+			c.health.SetUDP4Unbound(false)
 		}
 		return nil
 	}
@@ -2482,7 +2489,7 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 	// we get a link change and we can try binding again.
 	ruc.setConnLocked(newBlockForeverConn(), "", c.bind.BatchSize())
 	if network == "udp4" {
-		health.SetUDP4Unbound(true)
+		c.health.SetUDP4Unbound(true)
 	}
 	return fmt.Errorf("failed to bind any ports (tried %v)", ports)
 }

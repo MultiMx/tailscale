@@ -131,7 +131,8 @@ type CapabilityVersion int
 //   - 88: 2024-03-05: Client understands NodeAttrSuggestExitNode
 //   - 89: 2024-03-23: Client no longer respects deleted PeerChange.Capabilities (use CapMap)
 //   - 90: 2024-04-03: Client understands PeerCapabilityTaildrive.
-const CurrentCapabilityVersion CapabilityVersion = 90
+//   - 91: 2024-04-24: Client understands PeerCapabilityTaildriveSharer.
+const CurrentCapabilityVersion CapabilityVersion = 91
 
 type StableID string
 
@@ -1357,8 +1358,12 @@ const (
 	// PeerCapabilityWebUI grants the ability for a peer to edit features from the
 	// device Web UI.
 	PeerCapabilityWebUI PeerCapability = "tailscale.com/cap/webui"
-	// PeerCapabilityTaildrive grants the ability for a peer to access Taildrive shares.
+	// PeerCapabilityTaildrive grants the ability for a peer to access Taildrive
+	// shares.
 	PeerCapabilityTaildrive PeerCapability = "tailscale.com/cap/drive"
+	// PeerCapabilityTaildriveSharer indicates that a peer has the ability to
+	// share folders with us.
+	PeerCapabilityTaildriveSharer PeerCapability = "tailscale.com/cap/drive-sharer"
 )
 
 // NodeCapMap is a map of capabilities to their optional values. It is valid for
@@ -2245,6 +2250,15 @@ const (
 
 	// NodeAttrLogExitFlows enables exit node destinations in network flow logs.
 	NodeAttrLogExitFlows NodeCapability = "log-exit-flows"
+
+	// NodeAttrAutoExitNode permits the automatic exit nodes feature.
+	NodeAttrAutoExitNode NodeCapability = "auto-exit-node"
+
+	// NodeAttrStoreAppCRoutes configures the node to store app connector routes persistently.
+	NodeAttrStoreAppCRoutes NodeCapability = "store-appc-routes"
+
+	// NodeAttrSuggestExitNodeUI allows the currently suggested exit node to appear in the client GUI.
+	NodeAttrSuggestExitNodeUI NodeCapability = "suggest-exit-node-ui"
 )
 
 // SetDNSRequest is a request to add a DNS record.

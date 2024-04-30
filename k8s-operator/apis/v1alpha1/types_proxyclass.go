@@ -52,7 +52,14 @@ type ProxyClassSpec struct {
 	// Configuration parameters for the proxy's StatefulSet. Tailscale
 	// Kubernetes operator deploys a StatefulSet for each of the user
 	// configured proxies (Tailscale Ingress, Tailscale Service, Connector).
+	// +optional
 	StatefulSet *StatefulSet `json:"statefulSet"`
+	// Configuration for proxy metrics. Metrics are currently not supported
+	// for egress proxies and for Ingress proxies that have been configured
+	// with tailscale.com/experimental-forward-cluster-traffic-via-ingress
+	// annotation.
+	// +optional
+	Metrics *Metrics `json:"metrics,omitempty"`
 }
 
 type StatefulSet struct {
@@ -94,6 +101,11 @@ type Pod struct {
 	// https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/#syntax-and-character-set
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`
+	// Proxy Pod's affinity rules.
+	// By default, the Tailscale Kubernetes operator does not apply any affinity rules.
+	// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#affinity
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
 	// Configuration for the proxy container running tailscale.
 	// +optional
 	TailscaleContainer *Container `json:"tailscaleContainer,omitempty"`
@@ -126,6 +138,14 @@ type Pod struct {
 	// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#scheduling
 	// +optional
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+	// +optional
+}
+
+type Metrics struct {
+	// Setting enable to true will make the proxy serve Tailscale metrics
+	// at <pod-ip>:9001/debug/metrics.
+	// Defaults to false.
+	Enable bool `json:"enable"`
 }
 
 type Container struct {

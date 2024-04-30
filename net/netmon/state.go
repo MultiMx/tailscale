@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package interfaces contains helpers for looking up system network interfaces.
-package interfaces
+package netmon
 
 import (
 	"bytes"
@@ -146,7 +146,7 @@ func (i Interface) Addrs() ([]net.Addr, error) {
 // ForeachInterfaceAddress is a wrapper for GetList, then
 // List.ForeachInterfaceAddress.
 func ForeachInterfaceAddress(fn func(Interface, netip.Prefix)) error {
-	ifaces, err := GetList()
+	ifaces, err := GetInterfaceList()
 	if err != nil {
 		return err
 	}
@@ -156,7 +156,7 @@ func ForeachInterfaceAddress(fn func(Interface, netip.Prefix)) error {
 // ForeachInterfaceAddress calls fn for each interface in ifaces, with
 // all its addresses. The IPPrefix's IP is the IP address assigned to
 // the interface, and Bits are the subnet mask.
-func (ifaces List) ForeachInterfaceAddress(fn func(Interface, netip.Prefix)) error {
+func (ifaces InterfaceList) ForeachInterfaceAddress(fn func(Interface, netip.Prefix)) error {
 	for _, iface := range ifaces {
 		addrs, err := iface.Addrs()
 		if err != nil {
@@ -177,7 +177,7 @@ func (ifaces List) ForeachInterfaceAddress(fn func(Interface, netip.Prefix)) err
 // ForeachInterface is a wrapper for GetList, then
 // List.ForeachInterface.
 func ForeachInterface(fn func(Interface, []netip.Prefix)) error {
-	ifaces, err := GetList()
+	ifaces, err := GetInterfaceList()
 	if err != nil {
 		return err
 	}
@@ -187,7 +187,7 @@ func ForeachInterface(fn func(Interface, []netip.Prefix)) error {
 // ForeachInterface calls fn for each interface in ifaces, with
 // all its addresses. The IPPrefix's IP is the IP address assigned to
 // the interface, and Bits are the subnet mask.
-func (ifaces List) ForeachInterface(fn func(Interface, []netip.Prefix)) error {
+func (ifaces InterfaceList) ForeachInterface(fn func(Interface, []netip.Prefix)) error {
 	for _, iface := range ifaces {
 		addrs, err := iface.Addrs()
 		if err != nil {
@@ -677,11 +677,11 @@ func RegisterInterfaceGetter(getInterfaces func() ([]Interface, error)) {
 	altNetInterfaces = getInterfaces
 }
 
-// List is a list of interfaces on the machine.
-type List []Interface
+// InterfaceList is a list of interfaces on the machine.
+type InterfaceList []Interface
 
-// GetList returns the list of interfaces on the machine.
-func GetList() (List, error) {
+// GetInterfaceList returns the list of interfaces on the machine.
+func GetInterfaceList() (InterfaceList, error) {
 	return netInterfaces()
 }
 
