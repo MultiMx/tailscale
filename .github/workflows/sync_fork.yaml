@@ -17,3 +17,4 @@ jobs:
           base: main
           head: main
           token: ${{ secrets.PERSONAL_TOKEN }}
+          ignore_fail: true
