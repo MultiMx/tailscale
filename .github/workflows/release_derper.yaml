@@ -1,4 +1,4 @@
-name: Release Derper
+name: Release Derper Docker Image
 
 on:
   push:
@@ -6,13 +6,13 @@ on:
       - main
 
 jobs:
-  Release:
+  release_docker:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v3
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: 'stable'
 
@@ -57,3 +57,21 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64,linux/arm64,linux/386
+
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Build
+        uses: Mmx233/GoReleaseCli@v1.1.1
+        with:
+          target: ./cmd/derper
+          compress: tar.gz
+
+      - name: Upload assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ github.workspace }}/build/*.tar.gz
+          prerelease: false
