@@ -2,8 +2,8 @@ name: Release Derper Docker Image
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - v*.*.*
 
 jobs:
   release_docker:
