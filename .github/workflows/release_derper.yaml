@@ -2,8 +2,8 @@ name: Release Derper Docker Image
 
 on:
   push:
-   branches:
-     - main
+   tags:
+     - v**
 
 jobs:
   release_docker:
@@ -71,7 +71,7 @@ jobs:
           compress: tar.gz
           soft-float: true
 
-      - uses: actions/upload-artifact@v4
+      - uses: softprops/action-gh-release@v2
         with:
-          name: tailscale derper
-          path: build/*.tar.gz
+          files: build/*.tar.gz
+          token: ${{ secrets.PERSONAL_TOKEN }}
