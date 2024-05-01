@@ -65,7 +65,7 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Build
-        uses: Mmx233/GoReleaseCli@v1.1.1
+        uses: Mmx233/GoReleaseCli@v1.1.2
         with:
           target: ./cmd/derper
           compress: tar.gz
