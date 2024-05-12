@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/tcnksm/go-httpstat"
@@ -395,9 +396,7 @@ func makeProbePlan(dm *tailcfg.DERPMap, ifState *netmon.State, last *Report) (pl
 	have6if := ifState.HaveV6
 	have4if := ifState.HaveV4
 	plan = make(probePlan)
-	if !have4if && !have6if {
-		return plan
-	}
+
 	had4 := len(last.RegionV4Latency) > 0
 	had6 := len(last.RegionV6Latency) > 0
 	hadBoth := have6if && had4 && had6
@@ -451,10 +450,10 @@ func makeProbePlan(dm *tailcfg.DERPMap, ifState *netmon.State, last *Report) (pl
 			if try > 1 {
 				delay += time.Duration(try) * 50 * time.Millisecond
 			}
-			if do4 {
+			if n.IPv4 != "none" && (do4 || n.IsTestNode()) {
 				p4 = append(p4, probe{delay: delay, node: n.Name, proto: probeIPv4})
 			}
-			if do6 {
+			if n.IPv6 != "none" && (do6 || n.IsTestNode()) {
 				p6 = append(p6, probe{delay: delay, node: n.Name, proto: probeIPv6})
 			}
 		}
@@ -477,10 +476,10 @@ func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *netmon.State) (plan prob
 		for try := 0; try < 3; try++ {
 			n := reg.Nodes[try%len(reg.Nodes)]
 			delay := time.Duration(try) * defaultInitialRetransmitTime
-			if ifState.HaveV4 && nodeMight4(n) {
+			if n.IPv4 != "none" && ((ifState.HaveV4 && nodeMight4(n)) || n.IsTestNode()) {
 				p4 = append(p4, probe{delay: delay, node: n.Name, proto: probeIPv4})
 			}
-			if ifState.HaveV6 && nodeMight6(n) {
+			if n.IPv6 != "none" && ((ifState.HaveV6 && nodeMight6(n)) || n.IsTestNode()) {
 				p6 = append(p6, probe{delay: delay, node: n.Name, proto: probeIPv6})
 			}
 		}
@@ -1176,7 +1175,7 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 
 	var ip netip.Addr
 
-	dc := derphttp.NewNetcheckClient(c.logf)
+	dc := derphttp.NewNetcheckClient(c.logf, c.NetMon)
 	defer dc.Close()
 
 	tlsConn, tcpConn, node, err := dc.DialRegionTLS(ctx, reg)
@@ -1257,9 +1256,9 @@ func (c *Client) measureAllICMPLatency(ctx context.Context, rs *reportState, nee
 	for _, reg := range need {
 		go func(reg *tailcfg.DERPRegion) {
 			defer wg.Done()
-			if d, err := c.measureICMPLatency(ctx, reg, p); err != nil {
+			if d, ok, err := c.measureICMPLatency(ctx, reg, p); err != nil {
 				c.logf("[v1] measuring ICMP latency of %v (%d): %v", reg.RegionCode, reg.RegionID, err)
-			} else {
+			} else if ok {
 				c.logf("[v1] ICMP latency of %v (%d): %v", reg.RegionCode, reg.RegionID, d)
 				rs.mu.Lock()
 				if l, ok := rs.report.RegionLatency[reg.RegionID]; !ok {
@@ -1281,9 +1280,9 @@ func (c *Client) measureAllICMPLatency(ctx context.Context, rs *reportState, nee
 	return nil
 }
 
-func (c *Client) measureICMPLatency(ctx context.Context, reg *tailcfg.DERPRegion, p *ping.Pinger) (time.Duration, error) {
+func (c *Client) measureICMPLatency(ctx context.Context, reg *tailcfg.DERPRegion, p *ping.Pinger) (_ time.Duration, ok bool, err error) {
 	if len(reg.Nodes) == 0 {
-		return 0, fmt.Errorf("no nodes for region %d (%v)", reg.RegionID, reg.RegionCode)
+		return 0, false, fmt.Errorf("no nodes for region %d (%v)", reg.RegionID, reg.RegionCode)
 	}
 
 	// Try pinging the first node in the region
@@ -1295,7 +1294,7 @@ func (c *Client) measureICMPLatency(ctx context.Context, reg *tailcfg.DERPRegion
 	// TODO(andrew-d): this is a bit ugly
 	nodeAddr := c.nodeAddr(ctx, node, probeIPv4)
 	if !nodeAddr.IsValid() {
-		return 0, fmt.Errorf("no address for node %v", node.Name)
+		return 0, false, fmt.Errorf("no address for node %v", node.Name)
 	}
 	addr := &net.IPAddr{
 		IP:   net.IP(nodeAddr.Addr().AsSlice()),
@@ -1304,7 +1303,14 @@ func (c *Client) measureICMPLatency(ctx context.Context, reg *tailcfg.DERPRegion
 
 	// Use the unique node.Name field as the packet data to reduce the
 	// likelihood that we get a mismatched echo response.
-	return p.Send(ctx, addr, []byte(node.Name))
+	d, err := p.Send(ctx, addr, []byte(node.Name))
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return d, true, nil
 }
 
 func (c *Client) logConciseReport(r *Report, dm *tailcfg.DERPMap) {

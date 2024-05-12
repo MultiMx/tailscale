@@ -348,9 +348,14 @@ func (c *Auto) authRoutine() {
 			continue
 		}
 		if url != "" {
-			// goal.url ought to be empty here.
-			// However, not all control servers get this right,
-			// and logging about it here just generates noise.
+			// goal.url ought to be empty here. However, not all control servers
+			// get this right, and logging about it here just generates noise.
+			//
+			// TODO(bradfitz): I don't follow that comment. Our own testcontrol
+			// used by tstest/integration hits this path, in fact.
+			if c.direct.panicOnUse {
+				panic("tainted client")
+			}
 			c.mu.Lock()
 			c.urlToVisit = url
 			c.loginGoal = &LoginGoal{
@@ -615,6 +620,9 @@ func (c *Auto) Login(t *tailcfg.Oauth2Token, flags LoginFlags) {
 	if c.closed {
 		return
 	}
+	if c.direct != nil && c.direct.panicOnUse {
+		panic("tainted client")
+	}
 	c.wantLoggedIn = true
 	c.loginGoal = &LoginGoal{
 		token: t,
@@ -632,6 +640,9 @@ func (c *Auto) Logout(ctx context.Context) error {
 	c.wantLoggedIn = false
 	c.loginGoal = nil
 	closed := c.closed
+	if c.direct != nil && c.direct.panicOnUse {
+		panic("tainted client")
+	}
 	c.mu.Unlock()
 
 	if closed {
@@ -668,37 +679,35 @@ func (c *Auto) UpdateEndpoints(endpoints []tailcfg.Endpoint) {
 }
 
 func (c *Auto) Shutdown() {
-	c.logf("client.Shutdown()")
-
 	c.mu.Lock()
-	closed := c.closed
-	direct := c.direct
-	if !closed {
-		c.closed = true
-		c.observerQueue.Shutdown()
-		c.cancelAuthCtxLocked()
-		c.cancelMapCtxLocked()
-		for _, w := range c.unpauseWaiters {
-			w <- false
-		}
-		c.unpauseWaiters = nil
+	if c.closed {
+		c.mu.Unlock()
+		return
 	}
+	c.logf("client.Shutdown ...")
+
+	direct := c.direct
+	c.closed = true
+	c.observerQueue.Shutdown()
+	c.cancelAuthCtxLocked()
+	c.cancelMapCtxLocked()
+	for _, w := range c.unpauseWaiters {
+		w <- false
+	}
+	c.unpauseWaiters = nil
 	c.mu.Unlock()
 
-	c.logf("client.Shutdown")
-	if !closed {
-		c.unregisterHealthWatch()
-		<-c.authDone
-		<-c.mapDone
-		<-c.updateDone
-		if direct != nil {
-			direct.Close()
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		c.observerQueue.Wait(ctx)
-		c.logf("Client.Shutdown done.")
+	c.unregisterHealthWatch()
+	<-c.authDone
+	<-c.mapDone
+	<-c.updateDone
+	if direct != nil {
+		direct.Close()
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c.observerQueue.Wait(ctx)
+	c.logf("Client.Shutdown done.")
 }
 
 // NodePublicKey returns the node public key currently in use. This is

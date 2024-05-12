@@ -3088,3 +3088,9 @@ func (c *Conn) GetLastNetcheckReport(ctx context.Context) *netcheck.Report {
 	}
 	return lastReport
 }
+
+// SetLastNetcheckReportForTest sets the magicsock conn's last netcheck report.
+// Used for testing purposes.
+func (c *Conn) SetLastNetcheckReportForTest(ctx context.Context, report *netcheck.Report) {
+	c.lastNetCheckReport.Store(report)
+}

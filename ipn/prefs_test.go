@@ -56,6 +56,7 @@ func TestPrefsEqual(t *testing.T) {
 		"Egg",
 		"AdvertiseRoutes",
 		"NoSNAT",
+		"NoStatefulFiltering",
 		"NetfilterMode",
 		"OperatorUser",
 		"ProfileName",
@@ -372,7 +373,8 @@ func checkPrefs(t *testing.T, p Prefs) {
 	if p.Equals(p2) {
 		t.Fatalf("p == p2\n")
 	}
-	p2b, err = PrefsFromBytes(p2.ToBytes())
+	p2b = new(Prefs)
+	err = PrefsFromBytes(p2.ToBytes(), p2b)
 	if err != nil {
 		t.Fatalf("PrefsFromBytes(p2) failed\n")
 	}
@@ -585,7 +587,7 @@ func TestPrefsPretty(t *testing.T) {
 func TestLoadPrefsNotExist(t *testing.T) {
 	bogusFile := fmt.Sprintf("/tmp/not-exist-%d", time.Now().UnixNano())
 
-	p, err := LoadPrefs(bogusFile)
+	p, err := LoadPrefsWindows(bogusFile)
 	if errors.Is(err, os.ErrNotExist) {
 		// expected.
 		return
@@ -607,7 +609,7 @@ func TestLoadPrefsFileWithZeroInIt(t *testing.T) {
 	f.Close()
 	defer os.Remove(path)
 
-	p, err := LoadPrefs(path)
+	p, err := LoadPrefsWindows(path)
 	if errors.Is(err, os.ErrNotExist) {
 		// expected.
 		return
