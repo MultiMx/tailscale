@@ -6,7 +6,7 @@ on:
       - v**
 
 jobs:
-  release_docker:
+  release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -16,19 +16,23 @@ jobs:
         with:
           go-version: 'stable'
 
-      - name: Gen Go Commands
-        id: go_build
-        uses: MultiMx/GoBuildxAction@v0.7
+      - name: Setup Release Environment
+        uses: robinraju/release-downloader@v1.10
         with:
-          name: runner
-          args: "-gcflags=-trimpath=$GOPATH -asmflags=-trimpath=$GOPATH -ldflags '-extldflags \"-static -fpic\"'"
-          platform: linux/amd64,linux/arm64,linux/386
-          target: ./cmd/derper
+          repository: "Mmx233/GoReleaseCli"
+          latest: true
+          fileName: 'release_linux_amd64.tar.gz'
+          extract: true
+      - run: mv release /usr/bin/
 
       - name: Build Binary
-        env:
-          CGO_ENABLED: 0
-        run: ${{ steps.go_build.outputs.commands }}
+        run: release ./cmd/derper -c tar.gz --soft-float
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*.tar.gz
+          token: ${{ secrets.PERSONAL_TOKEN }}
 
       - name: Docker meta
         id: meta
@@ -57,21 +61,3 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64,linux/arm64,linux/386
-
-  release:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Build
-        uses: Mmx233/GoReleaseCli@v1.1.10
-        with:
-          target: ./cmd/derper
-          compress: tar.gz
-          soft-float: true
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: build/*.tar.gz
-          token: ${{ secrets.PERSONAL_TOKEN }}
