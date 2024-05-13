@@ -23,15 +23,15 @@ jobs:
           latest: true
           fileName: 'release_linux_amd64.tar.gz'
           extract: true
-      - run: mv release /usr/bin/
+          out-file-path: './build/'
 
       - name: Build Binary
-        run: release ./cmd/derper -c tar.gz --soft-float
+        run: ./build/release ./cmd/derper -c tar.gz --soft-float --output build/output
 
       - name: Upload Release
         uses: softprops/action-gh-release@v2
         with:
-          files: build/*.tar.gz
+          files: build/output/*.tar.gz
           token: ${{ secrets.PERSONAL_TOKEN }}
 
       - name: Docker meta

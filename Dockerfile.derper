@@ -2,7 +2,7 @@ FROM alpine:latest
 ARG TARGETOS
 ARG TARGETARCH
 
-COPY /build/derper_${TARGETOS}_${TARGETARCH} /usr/bin/runner
+COPY /build/output/derper_${TARGETOS}_${TARGETARCH} /usr/bin/runner
 
 RUN chmod +x /usr/bin/runner
 
