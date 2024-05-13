@@ -23,7 +23,7 @@ jobs:
           latest: true
           fileName: 'release_linux_amd64.tar.gz'
           extract: true
-      - run: mv release /usr/bin/
+      - run: sudo mv release /usr/bin/
 
       - name: Build Binary
         run: release ./cmd/derper -c tar.gz --soft-float
