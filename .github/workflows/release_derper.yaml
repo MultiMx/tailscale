@@ -16,7 +16,7 @@ jobs:
         with:
           go-version: 'stable'
 
-      - name: Setup Release Environment
+      - name: Setup Release Cli
         uses: robinraju/release-downloader@v1.10
         with:
           repository: "Mmx233/GoReleaseCli"
@@ -26,7 +26,7 @@ jobs:
           out-file-path: './build/'
 
       - name: Build Binary
-        run: ./build/release ./cmd/derper -c tar.gz --soft-float --output build/output
+        run: ./build/release ./cmd/derper -c tar.gz --soft-float --output build/output --perm 777
 
       - name: Upload Release
         uses: softprops/action-gh-release@v2
