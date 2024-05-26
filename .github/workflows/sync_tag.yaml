@@ -17,12 +17,11 @@ jobs:
       - name: Add tag
         run: |
           git config --local user.email "green.dusk8264@fastmail.com"
-          git config --local user.name "Mmx233"
+          git config --local user.name "GitHub Action"
           version=$(wget -qO- -t1 -T2 "https://api.github.com/repos/tailscale/tailscale/releases/latest" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')-$(git rev-parse --short ${{ github.sha }})
           git tag -a $version -m "release $version"
 
       - name: Push tags
         uses: ad-m/github-push-action@master
         with:
-          github_token: ${{ secrets.PERSONAL_TOKEN }}
           branch: main
