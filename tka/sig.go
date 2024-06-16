@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/hdevalence/ed25519consensus"
@@ -94,6 +95,41 @@ type NodeKeySignature struct {
 	// SigCredential signatures use this field to specify the public key
 	// they are certifying, following the usual semanticsfor WrappingPubkey.
 	WrappingPubkey []byte `cbor:"6,keyasint,omitempty"`
+}
+
+// String returns a human-readable representation of the NodeKeySignature,
+// making it easy to see nested signatures.
+func (s NodeKeySignature) String() string {
+	var b strings.Builder
+	var addToBuf func(NodeKeySignature, int)
+	addToBuf = func(sig NodeKeySignature, depth int) {
+		indent := strings.Repeat("  ", depth)
+		b.WriteString(indent + "SigKind: " + sig.SigKind.String() + "\n")
+		if len(sig.Pubkey) > 0 {
+			var pubKey string
+			var np key.NodePublic
+			if err := np.UnmarshalBinary(sig.Pubkey); err != nil {
+				pubKey = fmt.Sprintf("<error: %s>", err)
+			} else {
+				pubKey = np.ShortString()
+			}
+			b.WriteString(indent + "Pubkey: " + pubKey + "\n")
+		}
+		if len(sig.KeyID) > 0 {
+			keyID := key.NLPublicFromEd25519Unsafe(sig.KeyID).CLIString()
+			b.WriteString(indent + "KeyID: " + keyID + "\n")
+		}
+		if len(sig.WrappingPubkey) > 0 {
+			pubKey := key.NLPublicFromEd25519Unsafe(sig.WrappingPubkey).CLIString()
+			b.WriteString(indent + "WrappingPubkey: " + pubKey + "\n")
+		}
+		if sig.Nested != nil {
+			b.WriteString(indent + "Nested:\n")
+			addToBuf(*sig.Nested, depth+1)
+		}
+	}
+	addToBuf(s, 0)
+	return strings.TrimSpace(b.String())
 }
 
 // UnverifiedWrappingPublic returns the public key which must sign a
@@ -267,4 +303,79 @@ func (s *NodeKeySignature) verifySignature(nodeKey key.NodePublic, verificationK
 	default:
 		return fmt.Errorf("unhandled signature type: %v", s.SigKind)
 	}
+}
+
+// RotationDetails holds additional information about a nodeKeySignature
+// of kind SigRotation.
+type RotationDetails struct {
+	// PrevNodeKeys is a list of node keys which have been rotated out.
+	PrevNodeKeys []key.NodePublic
+
+	// WrappingPubkey is the public key which has been authorized to sign
+	// this rotating signature.
+	WrappingPubkey []byte
+}
+
+// rotationDetails returns the RotationDetails for a SigRotation signature.
+func (s *NodeKeySignature) rotationDetails() (*RotationDetails, error) {
+	if s.SigKind != SigRotation {
+		return nil, nil
+	}
+
+	sri := &RotationDetails{}
+	nested := s.Nested
+	for nested != nil {
+		if len(nested.Pubkey) > 0 {
+			var nestedPub key.NodePublic
+			if err := nestedPub.UnmarshalBinary(nested.Pubkey); err != nil {
+				return nil, fmt.Errorf("nested pubkey: %v", err)
+			}
+			sri.PrevNodeKeys = append(sri.PrevNodeKeys, nestedPub)
+		}
+		if nested.SigKind != SigRotation {
+			break
+		}
+		nested = nested.Nested
+	}
+	sri.WrappingPubkey = nested.WrappingPubkey
+	return sri, nil
+}
+
+// ResignNKS re-signs a node-key signature for a new node-key.
+//
+// This only matters on network-locked tailnets, because node-key signatures are
+// how other nodes know that a node-key is authentic. When the node-key is
+// rotated then the existing signature becomes invalid, so this function is
+// responsible for generating a new wrapping signature to certify the new node-key.
+//
+// The signature itself is a SigRotation signature, which embeds the old signature
+// and certifies the new node-key as a replacement for the old by signing the new
+// signature with RotationPubkey (which is the node's own network-lock key).
+func ResignNKS(priv key.NLPrivate, nodeKey key.NodePublic, oldNKS tkatype.MarshaledSignature) (tkatype.MarshaledSignature, error) {
+	var oldSig NodeKeySignature
+	if err := oldSig.Unserialize(oldNKS); err != nil {
+		return nil, fmt.Errorf("decoding NKS: %w", err)
+	}
+
+	nk, err := nodeKey.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("marshalling node-key: %w", err)
+	}
+
+	if bytes.Equal(nk, oldSig.Pubkey) {
+		// The old signature is valid for the node-key we are using, so just
+		// use it verbatim.
+		return oldNKS, nil
+	}
+
+	newSig := NodeKeySignature{
+		SigKind: SigRotation,
+		Pubkey:  nk,
+		Nested:  &oldSig,
+	}
+	if newSig.Signature, err = priv.SignNKS(newSig.SigHash()); err != nil {
+		return nil, fmt.Errorf("signing NKS: %w", err)
+	}
+
+	return newSig.Serialize(), nil
 }

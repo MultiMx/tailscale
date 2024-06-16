@@ -29,7 +29,6 @@ import (
 
 	"github.com/google/uuid"
 	"tailscale.com/clientupdate/distsign"
-	"tailscale.com/hostinfo"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/cmpver"
 	"tailscale.com/util/winutil"
@@ -163,10 +162,9 @@ func NewUpdater(args Arguments) (*Updater, error) {
 type updateFunction func() error
 
 func (up *Updater) getUpdateFunction() (fn updateFunction, canAutoUpdate bool) {
-	canAutoUpdate = !hostinfo.New().Container.EqualBool(true) // EqualBool(false) would return false if the value is not set.
 	switch runtime.GOOS {
 	case "windows":
-		return up.updateWindows, canAutoUpdate
+		return up.updateWindows, true
 	case "linux":
 		switch distro.Get() {
 		case distro.NixOS:
@@ -180,20 +178,20 @@ func (up *Updater) getUpdateFunction() (fn updateFunction, canAutoUpdate bool) {
 			// auto-update mechanism.
 			return up.updateSynology, false
 		case distro.Debian: // includes Ubuntu
-			return up.updateDebLike, canAutoUpdate
+			return up.updateDebLike, true
 		case distro.Arch:
 			if up.archPackageInstalled() {
 				// Arch update func just prints a message about how to update,
 				// it doesn't support auto-updates.
 				return up.updateArchLike, false
 			}
-			return up.updateLinuxBinary, canAutoUpdate
+			return up.updateLinuxBinary, true
 		case distro.Alpine:
-			return up.updateAlpineLike, canAutoUpdate
+			return up.updateAlpineLike, true
 		case distro.Unraid:
-			return up.updateUnraid, canAutoUpdate
+			return up.updateUnraid, true
 		case distro.QNAP:
-			return up.updateQNAP, canAutoUpdate
+			return up.updateQNAP, true
 		}
 		switch {
 		case haveExecutable("pacman"):
@@ -202,21 +200,21 @@ func (up *Updater) getUpdateFunction() (fn updateFunction, canAutoUpdate bool) {
 				// it doesn't support auto-updates.
 				return up.updateArchLike, false
 			}
-			return up.updateLinuxBinary, canAutoUpdate
+			return up.updateLinuxBinary, true
 		case haveExecutable("apt-get"): // TODO(awly): add support for "apt"
 			// The distro.Debian switch case above should catch most apt-based
 			// systems, but add this fallback just in case.
-			return up.updateDebLike, canAutoUpdate
+			return up.updateDebLike, true
 		case haveExecutable("dnf"):
-			return up.updateFedoraLike("dnf"), canAutoUpdate
+			return up.updateFedoraLike("dnf"), true
 		case haveExecutable("yum"):
-			return up.updateFedoraLike("yum"), canAutoUpdate
+			return up.updateFedoraLike("yum"), true
 		case haveExecutable("apk"):
-			return up.updateAlpineLike, canAutoUpdate
+			return up.updateAlpineLike, true
 		}
 		// If nothing matched, fall back to tarball updates.
 		if up.Update == nil {
-			return up.updateLinuxBinary, canAutoUpdate
+			return up.updateLinuxBinary, true
 		}
 	case "darwin":
 		switch {
@@ -232,7 +230,7 @@ func (up *Updater) getUpdateFunction() (fn updateFunction, canAutoUpdate bool) {
 			return nil, false
 		}
 	case "freebsd":
-		return up.updateFreeBSD, canAutoUpdate
+		return up.updateFreeBSD, true
 	}
 	return nil, false
 }
@@ -653,6 +651,9 @@ func (up *Updater) updateAlpineLike() (err error) {
 		return fmt.Errorf(`failed to parse latest version from "apk info tailscale": %w`, err)
 	}
 	if !up.confirm(ver) {
+		if err := checkOutdatedAlpineRepo(up.Logf, ver, up.Track); err != nil {
+			up.Logf("failed to check whether Alpine release is outdated: %v", err)
+		}
 		return nil
 	}
 
@@ -688,6 +689,37 @@ func parseAlpinePackageVersion(out []byte) (string, error) {
 		return maxVer, nil
 	}
 	return "", errors.New("tailscale version not found in output")
+}
+
+var apkRepoVersionRE = regexp.MustCompile(`v[0-9]+\.[0-9]+`)
+
+func checkOutdatedAlpineRepo(logf logger.Logf, apkVer, track string) error {
+	latest, err := LatestTailscaleVersion(track)
+	if err != nil {
+		return err
+	}
+	if latest == apkVer {
+		// Actually on latest release.
+		return nil
+	}
+	f, err := os.Open("/etc/apk/repositories")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// Read the first repo line. Typically, there are multiple repos that all
+	// contain the same version in the path, like:
+	//   https://dl-cdn.alpinelinux.org/alpine/v3.20/main
+	//   https://dl-cdn.alpinelinux.org/alpine/v3.20/community
+	s := bufio.NewScanner(f)
+	if !s.Scan() {
+		return s.Err()
+	}
+	alpineVer := apkRepoVersionRE.FindString(s.Text())
+	if alpineVer != "" {
+		logf("The latest Tailscale release for Linux is %q, but your apk repository only provides %q.\nYour Alpine version is %q, you may need to upgrade the system to get the latest Tailscale version: https://wiki.alpinelinux.org/wiki/Upgrading_Alpine", latest, apkVer, alpineVer)
+	}
+	return nil
 }
 
 func (up *Updater) updateMacSys() error {

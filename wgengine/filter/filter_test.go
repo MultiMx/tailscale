@@ -5,14 +5,18 @@ package filter
 
 import (
 	"encoding/hex"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"net/netip"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"go4.org/netipx"
 	xmaps "golang.org/x/exp/maps"
 	"tailscale.com/net/packet"
@@ -22,6 +26,8 @@ import (
 	"tailscale.com/tstime/rate"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/views"
+	"tailscale.com/util/must"
 )
 
 // testAllowedProto is an IP protocol number we treat as allowed for
@@ -36,9 +42,10 @@ func m(srcs []netip.Prefix, dsts []NetPortRange, protos ...ipproto.Proto) Match 
 		protos = defaultProtos
 	}
 	return Match{
-		IPProto: protos,
-		Srcs:    srcs,
-		Dsts:    dsts,
+		IPProto:      protos,
+		Srcs:         srcs,
+		SrcsContains: tsaddr.NewContainsIPFunc(views.SliceOf(srcs)),
+		Dsts:         dsts,
 	}
 }
 
@@ -432,11 +439,11 @@ func TestLoggingPrivacy(t *testing.T) {
 		logged = true
 	}
 
-	var logB netipx.IPSetBuilder
-	logB.AddPrefix(netip.MustParsePrefix("100.64.0.0/10"))
-	logB.AddPrefix(tsaddr.TailscaleULARange())
 	f := newFilter(logf)
-	f.logIPs, _ = logB.IPSet()
+	f.logIPs = tsaddr.NewContainsIPFunc(views.SliceOf([]netip.Prefix{
+		tsaddr.CGNATRange(),
+		tsaddr.TailscaleULARange(),
+	}))
 
 	var (
 		ts4       = netip.AddrPortFrom(tsaddr.CGNATRange().Addr().Next(), 1234)
@@ -816,10 +823,12 @@ func TestMatchesFromFilterRules(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-
-			compareIP := cmp.Comparer(func(a, b netip.Addr) bool { return a == b })
-			compareIPPrefix := cmp.Comparer(func(a, b netip.Prefix) bool { return a == b })
-			if diff := cmp.Diff(got, tt.want, compareIP, compareIPPrefix); diff != "" {
+			cmpOpts := []cmp.Option{
+				cmp.Comparer(func(a, b netip.Addr) bool { return a == b }),
+				cmp.Comparer(func(a, b netip.Prefix) bool { return a == b }),
+				cmpopts.IgnoreFields(Match{}, ".SrcsContains"),
+			}
+			if diff := cmp.Diff(got, tt.want, cmpOpts...); diff != "" {
 				t.Errorf("wrong (-got+want)\n%s", diff)
 			}
 		})
@@ -952,5 +961,82 @@ func TestPeerCaps(t *testing.T) {
 				t.Errorf("got %q; want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+var (
+	filterMatchFile = flag.String("filter-match-file", "", "JSON file of []filter.Match to benchmark")
+)
+
+func BenchmarkFilterMatchFile(b *testing.B) {
+	if *filterMatchFile == "" {
+		b.Skip("no --filter-match-file specified; skipping")
+	}
+	benchmarkFile(b, *filterMatchFile, benchOpt{v4: true, validLocalDst: true})
+}
+
+func BenchmarkFilterMatch(b *testing.B) {
+	b.Run("not-local-v4", func(b *testing.B) {
+		benchmarkFile(b, "testdata/matches-1.json", benchOpt{v4: true, validLocalDst: false})
+	})
+	b.Run("not-local-v6", func(b *testing.B) {
+		benchmarkFile(b, "testdata/matches-1.json", benchOpt{v4: false, validLocalDst: false})
+	})
+	b.Run("no-match-v4", func(b *testing.B) {
+		benchmarkFile(b, "testdata/matches-1.json", benchOpt{v4: true, validLocalDst: true})
+	})
+	b.Run("no-match-v6", func(b *testing.B) {
+		benchmarkFile(b, "testdata/matches-1.json", benchOpt{v4: false, validLocalDst: true})
+	})
+}
+
+type benchOpt struct {
+	v4            bool
+	validLocalDst bool
+}
+
+func benchmarkFile(b *testing.B, file string, opt benchOpt) {
+	var matches []Match
+	bts, err := os.ReadFile(file)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := json.Unmarshal(bts, &matches); err != nil {
+		b.Fatal(err)
+	}
+
+	var localNets netipx.IPSetBuilder
+	pfx := []netip.Prefix{
+		netip.MustParsePrefix("100.96.14.120/32"),
+		netip.MustParsePrefix("fd7a:115c:a1e0:ab12:4843:cd96:6260:e78/32"),
+	}
+	for _, p := range pfx {
+		localNets.AddPrefix(p)
+	}
+
+	var logIPs netipx.IPSetBuilder
+	logIPs.AddPrefix(tsaddr.CGNATRange())
+	logIPs.AddPrefix(tsaddr.TailscaleULARange())
+
+	f := New(matches, must.Get(localNets.IPSet()), must.Get(logIPs.IPSet()), nil, logger.Discard)
+	var srcIP string
+	var dstIP netip.Addr
+	if opt.v4 {
+		srcIP = "1.2.3.4"
+		dstIP = pfx[0].Addr()
+	} else {
+		srcIP = "2012::3456"
+		dstIP = pfx[1].Addr()
+	}
+	if !opt.validLocalDst {
+		dstIP = dstIP.Next() // to make it not in localNets
+	}
+	pkt := parsed(ipproto.TCP, srcIP, dstIP.String(), 33123, 443)
+
+	for range b.N {
+		got := f.RunIn(&pkt, 0)
+		if got != Drop {
+			b.Fatalf("got %v; want Drop", got)
+		}
 	}
 }

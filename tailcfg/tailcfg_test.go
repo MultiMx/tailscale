@@ -854,6 +854,57 @@ func TestRawMessage(t *testing.T) {
 	}
 }
 
+func TestMarshalToRawMessageAndBack(t *testing.T) {
+	type inner struct {
+		Groups []string `json:"groups,omitempty"`
+	}
+	testip := netip.MustParseAddrPort("1.2.3.4:80")
+	type testRule struct {
+		Ports    []int            `json:"ports,omitempty"`
+		ToggleOn bool             `json:"toggleOn,omitempty"`
+		Name     string           `json:"name,omitempty"`
+		Groups   inner            `json:"groups,omitempty"`
+		Addrs    []netip.AddrPort `json:"addrs"`
+	}
+	tests := []struct {
+		name    string
+		capType PeerCapability
+		val     testRule
+	}{
+		{
+			name:    "empty",
+			val:     testRule{},
+			capType: PeerCapability("foo"),
+		},
+		{
+			name:    "some values",
+			val:     testRule{Ports: []int{80, 443}, Name: "foo"},
+			capType: PeerCapability("foo"),
+		},
+		{
+			name:    "all values",
+			val:     testRule{Ports: []int{80, 443}, Name: "foo", ToggleOn: true, Groups: inner{Groups: []string{"foo", "bar"}}, Addrs: []netip.AddrPort{testip}},
+			capType: PeerCapability("foo"),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := MarshalCapJSON(tc.val)
+			if err != nil {
+				t.Fatalf("unexpected error marshalling raw message: %v", err)
+			}
+			cap := PeerCapMap{tc.capType: []RawMessage{raw}}
+			after, err := UnmarshalCapJSON[testRule](cap, tc.capType)
+			if err != nil {
+				t.Fatalf("unexpected error unmarshaling raw message: %v", err)
+			}
+			if !reflect.DeepEqual([]testRule{tc.val}, after) {
+				t.Errorf("got %#v; want %#v", after, []testRule{tc.val})
+			}
+		})
+	}
+}
+
 func TestDeps(t *testing.T) {
 	deptest.DepChecker{
 		BadDeps: map[string]string{
@@ -864,4 +915,28 @@ func TestDeps(t *testing.T) {
 			"github.com/studio-b12/gowebdav": "https://github.com/tailscale/tailscale/pull/10631",
 		},
 	}.Check(t)
+}
+
+func TestCheckTag(t *testing.T) {
+	tests := []struct {
+		name string
+		tag  string
+		want bool
+	}{
+		{"empty", "", false},
+		{"good", "tag:foo", true},
+		{"bad", "tag:", false},
+		{"no_leading_num", "tag:1foo", false},
+		{"no_punctuation", "tag:foa@bar", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := CheckTag(tt.tag)
+			if err == nil && !tt.want {
+				t.Errorf("got nil; want error")
+			} else if err != nil && tt.want {
+				t.Errorf("got %v; want nil", err)
+			}
+		})
+	}
 }

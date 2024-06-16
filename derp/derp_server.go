@@ -22,7 +22,7 @@ import (
 	"log"
 	"math"
 	"math/big"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
@@ -329,18 +329,34 @@ func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 	s.initMetacert()
 	s.packetsRecvDisco = s.packetsRecvByKind.Get("disco")
 	s.packetsRecvOther = s.packetsRecvByKind.Get("other")
-	s.packetsDroppedReasonCounters = []*expvar.Int{
-		s.packetsDroppedReason.Get("unknown_dest"),
-		s.packetsDroppedReason.Get("unknown_dest_on_fwd"),
-		s.packetsDroppedReason.Get("gone_disconnected"),
-		s.packetsDroppedReason.Get("gone_not_here"),
-		s.packetsDroppedReason.Get("queue_head"),
-		s.packetsDroppedReason.Get("queue_tail"),
-		s.packetsDroppedReason.Get("write_error"),
-	}
+
+	s.packetsDroppedReasonCounters = s.genPacketsDroppedReasonCounters()
+
 	s.packetsDroppedTypeDisco = s.packetsDroppedType.Get("disco")
 	s.packetsDroppedTypeOther = s.packetsDroppedType.Get("other")
 	return s
+}
+
+func (s *Server) genPacketsDroppedReasonCounters() []*expvar.Int {
+	getMetric := s.packetsDroppedReason.Get
+	ret := []*expvar.Int{
+		dropReasonUnknownDest:      getMetric("unknown_dest"),
+		dropReasonUnknownDestOnFwd: getMetric("unknown_dest_on_fwd"),
+		dropReasonGoneDisconnected: getMetric("gone_disconnected"),
+		dropReasonQueueHead:        getMetric("queue_head"),
+		dropReasonQueueTail:        getMetric("queue_tail"),
+		dropReasonWriteError:       getMetric("write_error"),
+		dropReasonDupClient:        getMetric("dup_client"),
+	}
+	if len(ret) != int(numDropReasons) {
+		panic("dropReason metrics out of sync")
+	}
+	for i := range numDropReasons {
+		if ret[i] == nil {
+			panic("dropReason metrics out of sync")
+		}
+	}
+	return ret
 }
 
 // SetMesh sets the pre-shared key that regional DERP servers used to mesh
@@ -1047,6 +1063,7 @@ const (
 	dropReasonQueueTail                          // destination queue is full, dropped packet at queue tail
 	dropReasonWriteError                         // OS write() failed
 	dropReasonDupClient                          // the public key is connected 2+ times (active/active, fighting)
+	numDropReasons                               // unused; keep last
 )
 
 func (s *Server) recordDrop(packetBytes []byte, srcKey, dstKey key.NodePublic, reason dropReason) {
@@ -1134,20 +1151,19 @@ func (c *sclient) requestMeshUpdate() {
 	}
 }
 
+var localClient tailscale.LocalClient
+
 // verifyClient checks whether the client is allowed to connect to the derper,
 // depending on how & whether the server's been configured to verify.
 func (s *Server) verifyClient(ctx context.Context, clientKey key.NodePublic, info *clientInfo, clientIP netip.Addr) error {
 	// tailscaled-based verification:
 	if s.verifyClientsLocalTailscaled {
-		status, err := tailscale.Status(ctx)
+		_, err := localClient.WhoIsNodeKey(ctx, clientKey)
+		if err == tailscale.ErrPeerNotFound {
+			return fmt.Errorf("peer %v not authorized (not found in local tailscaled)", clientKey)
+		}
 		if err != nil {
-			return fmt.Errorf("failed to query local tailscaled status: %w", err)
-		}
-		if clientKey == status.Self.PublicKey {
-			return nil
-		}
-		if _, exists := status.Peer[clientKey]; !exists {
-			return fmt.Errorf("client %v not in set of peers", clientKey)
+			return fmt.Errorf("failed to query local tailscaled status for %v: %w", clientKey, err)
 		}
 	}
 
@@ -1497,7 +1513,7 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 		}
 	}()
 
-	jitter := time.Duration(rand.Intn(5000)) * time.Millisecond
+	jitter := rand.N(5 * time.Second)
 	keepAliveTick, keepAliveTickChannel := c.s.clock.NewTicker(keepAlive + jitter)
 	defer keepAliveTick.Stop()
 

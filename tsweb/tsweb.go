@@ -254,10 +254,18 @@ type HandlerOptions struct {
 	// is intended to be used to present pretty error pages if
 	// the user agent is determined to be a browser.
 	OnError ErrorHandlerFunc
+
+	// OnCompletion is called when ServeHTTP is finished and gets
+	// useful data that the implementor can use for metrics.
+	OnCompletion OnCompletionFunc
 }
 
 // ErrorHandlerFunc is called to present a error response.
 type ErrorHandlerFunc func(http.ResponseWriter, *http.Request, HTTPError)
+
+// OnCompletionFunc is called when ServeHTTP is finished and gets
+// useful data that the implementor can use for metrics.
+type OnCompletionFunc func(*http.Request, AccessLogRecord)
 
 // ReturnHandlerFunc is an adapter to allow the use of ordinary
 // functions as ReturnHandlers. If f is a function with the
@@ -299,7 +307,7 @@ type retHandler struct {
 // ServeHTTP implements the http.Handler interface.
 func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	msg := AccessLogRecord{
-		When:       h.opts.Now(),
+		Time:       h.opts.Now(),
 		RemoteAddr: r.RemoteAddr,
 		Proto:      r.Proto,
 		TLS:        r.TLS != nil,
@@ -371,7 +379,7 @@ func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		lw.code = 200
 	}
 
-	msg.Seconds = h.opts.Now().Sub(msg.When).Seconds()
+	msg.Seconds = h.opts.Now().Sub(msg.Time).Seconds()
 	msg.Code = lw.code
 	msg.Bytes = lw.bytes
 
@@ -433,6 +441,10 @@ func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			msg.Code = http.StatusInternalServerError
 			http.Error(lw, errorMessage, msg.Code)
 		}
+	}
+
+	if h.opts.OnCompletion != nil {
+		h.opts.OnCompletion(r, msg)
 	}
 
 	if bs := h.opts.BucketedStats; bs != nil && bs.Finished != nil {
