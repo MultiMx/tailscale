@@ -725,7 +725,7 @@ func (s *Server) accept(ctx context.Context, nc Conn, brw *bufio.ReadWriter, rem
 
 	clientAP, _ := netip.ParseAddrPort(remoteAddr)
 	if err := s.verifyClient(ctx, clientKey, clientInfo, clientAP.Addr()); err != nil {
-		return fmt.Errorf("client %x rejected: %v", clientKey, err)
+		return fmt.Errorf("client %v rejected: %v", clientKey, err)
 	}
 
 	// At this point we trust the client so we don't time out.
@@ -751,7 +751,7 @@ func (s *Server) accept(ctx context.Context, nc Conn, brw *bufio.ReadWriter, rem
 		discoSendQueue: make(chan pkt, perClientSendQueueDepth),
 		sendPongCh:     make(chan [8]byte, 1),
 		peerGone:       make(chan peerGoneMsg),
-		canMesh:        clientInfo.MeshKey != "" && clientInfo.MeshKey == s.meshKey,
+		canMesh:        s.isMeshPeer(clientInfo),
 		peerGoneLim:    rate.NewLimiter(rate.Every(time.Second), 3),
 	}
 
@@ -939,7 +939,7 @@ func (c *sclient) handleFrameForwardPacket(ft frameType, fl uint32) error {
 
 	srcKey, dstKey, contents, err := s.recvForwardPacket(c.br, fl)
 	if err != nil {
-		return fmt.Errorf("client %x: recvForwardPacket: %v", c.key, err)
+		return fmt.Errorf("client %v: recvForwardPacket: %v", c.key, err)
 	}
 	s.packetsForwardedIn.Add(1)
 
@@ -994,7 +994,7 @@ func (c *sclient) handleFrameSendPacket(ft frameType, fl uint32) error {
 
 	dstKey, contents, err := s.recvPacket(c.br, fl)
 	if err != nil {
-		return fmt.Errorf("client %x: recvPacket: %v", c.key, err)
+		return fmt.Errorf("client %v: recvPacket: %v", c.key, err)
 	}
 
 	var fwd PacketForwarder
@@ -1153,9 +1153,22 @@ func (c *sclient) requestMeshUpdate() {
 
 var localClient tailscale.LocalClient
 
+// isMeshPeer reports whether the client is a trusted mesh peer
+// node in the DERP region.
+func (s *Server) isMeshPeer(info *clientInfo) bool {
+	return info != nil && info.MeshKey != "" && info.MeshKey == s.meshKey
+}
+
 // verifyClient checks whether the client is allowed to connect to the derper,
 // depending on how & whether the server's been configured to verify.
 func (s *Server) verifyClient(ctx context.Context, clientKey key.NodePublic, info *clientInfo, clientIP netip.Addr) error {
+	if s.isMeshPeer(info) {
+		// Trusted mesh peer. No need to verify further. In fact, verifying
+		// further wouldn't work: it's not part of the tailnet so tailscaled and
+		// likely the admission control URL wouldn't know about it.
+		return nil
+	}
+
 	// tailscaled-based verification:
 	if s.verifyClientsLocalTailscaled {
 		_, err := localClient.WhoIsNodeKey(ctx, clientKey)
@@ -1955,10 +1968,35 @@ func (s *Server) ConsistencyCheck() error {
 			s.curClients.Value(),
 			len(s.clients)))
 	}
+
+	if s.verifyClientsLocalTailscaled {
+		if err := s.checkVerifyClientsLocalTailscaled(); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+
 	if len(errs) == 0 {
 		return nil
 	}
 	return errors.New(strings.Join(errs, ", "))
+}
+
+// checkVerifyClientsLocalTailscaled checks that a verifyClients call can be made successfully for the derper hosts own node key.
+func (s *Server) checkVerifyClientsLocalTailscaled() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	status, err := localClient.StatusWithoutPeers(ctx)
+	if err != nil {
+		return fmt.Errorf("localClient.Status: %w", err)
+	}
+	info := &clientInfo{
+		IsProber: true,
+	}
+	clientIP := netip.IPv6Loopback()
+	if err := s.verifyClient(ctx, status.Self.PublicKey, info, clientIP); err != nil {
+		return fmt.Errorf("verifyClient for self nodekey: %w", err)
+	}
+	return nil
 }
 
 const minTimeBetweenLogs = 2 * time.Second
