@@ -140,7 +140,9 @@ type CapabilityVersion int
 //   - 97: 2024-06-06: Client understands NodeAttrDisableSplitDNSWhenNoCustomResolvers
 //   - 98: 2024-06-13: iOS/tvOS clients may provide serial number as part of posture information
 //   - 99: 2024-06-14: Client understands NodeAttrDisableLocalDNSOverrideViaNRPT
-const CurrentCapabilityVersion CapabilityVersion = 99
+//   - 100: 2024-06-18: Client supports filtertype.Match.SrcCaps (issue #12542)
+//   - 101: 2024-07-01: Client supports SSH agent forwarding when handling connections with /bin/su
+const CurrentCapabilityVersion CapabilityVersion = 101
 
 type StableID string
 
@@ -1333,7 +1335,7 @@ var PortRangeAny = PortRange{0, 65535}
 type NetPortRange struct {
 	_     structs.Incomparable
 	IP    string // IP, CIDR, Range, or "*" (same formats as FilterRule.SrcIPs)
-	Bits  *int   // deprecated; the old way to turn IP into a CIDR
+	Bits  *int   // deprecated; the 2020 way to turn IP into a CIDR. See FilterRule.SrcBits.
 	Ports PortRange
 }
 
@@ -1470,7 +1472,7 @@ func (c PeerCapMap) HasCapability(cap PeerCapability) bool {
 // FilterRule represents one rule in a packet filter.
 //
 // A rule is logically a set of source CIDRs to match (described by
-// SrcIPs and SrcBits), and a set of destination targets that are then
+// SrcIPs), and a set of destination targets that are then
 // allowed if a source IP is matches of those CIDRs.
 type FilterRule struct {
 	// SrcIPs are the source IPs/networks to match.
@@ -1480,9 +1482,10 @@ type FilterRule struct {
 	//     * the string "*" to match everything (both IPv4 & IPv6)
 	//     * a CIDR (e.g. "192.168.0.0/16")
 	//     * a range of two IPs, inclusive, separated by hyphen ("2eff::1-2eff::0800")
+	//     * a string "cap:<capability>" with NodeCapMap cap name
 	SrcIPs []string
 
-	// SrcBits is deprecated; it's the old way to specify a CIDR
+	// SrcBits is deprecated; it was the old way to specify a CIDR
 	// prior to CapabilityVersion 7. Its values correspond to the
 	// SrcIPs above.
 	//
@@ -1493,10 +1496,14 @@ type FilterRule struct {
 	// position is 32, as if the SrcIPs above were a /32 mask. For
 	// a "*" SrcIPs value, the corresponding SrcBits value is
 	// ignored.
+	//
+	// This is still present in this file because the Tailscale control plane
+	// code still uses this type, for 118 clients that are still connected as of
+	// 2024-06-18, 3.5 years after the last release that used this type.
 	SrcBits []int `json:",omitempty"`
 
 	// DstPorts are the port ranges to allow once a source IP
-	// matches (is in the CIDR described by SrcIPs & SrcBits).
+	// matches (is in the CIDR described by SrcIPs).
 	//
 	// CapGrant and DstPorts are mutually exclusive: at most one can be non-nil.
 	DstPorts []NetPortRange `json:",omitempty"`
@@ -1527,11 +1534,9 @@ type FilterRule struct {
 
 var FilterAllowAll = []FilterRule{
 	{
-		SrcIPs:  []string{"*"},
-		SrcBits: nil,
+		SrcIPs: []string{"*"},
 		DstPorts: []NetPortRange{{
 			IP:    "*",
-			Bits:  nil,
 			Ports: PortRange{0, 65535},
 		}},
 	},
@@ -2197,10 +2202,6 @@ const (
 	// NodeAttrDebugDisableWGTrim disables the lazy WireGuard configuration,
 	// always giving WireGuard the full netmap, even for idle peers.
 	NodeAttrDebugDisableWGTrim NodeCapability = "debug-no-wg-trim"
-
-	// NodeAttrDebugDisableDRPO disables the DERP Return Path Optimization.
-	// See Issue 150.
-	NodeAttrDebugDisableDRPO NodeCapability = "debug-disable-drpo"
 
 	// NodeAttrDisableSubnetsIfPAC controls whether subnet routers should be
 	// disabled if WPAD is present on the network.

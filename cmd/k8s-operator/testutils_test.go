@@ -304,10 +304,6 @@ func expectedSTSUserspace(t *testing.T, cl client.Client, opts configOpts) *apps
 
 func expectedHeadlessService(name string, parentType string) *corev1.Service {
 	return &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:         name,
 			GenerateName: "ts-test-",
@@ -323,7 +319,8 @@ func expectedHeadlessService(name string, parentType string) *corev1.Service {
 			Selector: map[string]string{
 				"app": "1234-UID",
 			},
-			ClusterIP: "None",
+			ClusterIP:      "None",
+			IPFamilyPolicy: ptr.To(corev1.IPFamilyPolicyPreferDualStack),
 		},
 	}
 }
@@ -331,10 +328,6 @@ func expectedHeadlessService(name string, parentType string) *corev1.Service {
 func expectedSecret(t *testing.T, cl client.Client, opts configOpts) *corev1.Secret {
 	t.Helper()
 	s := &corev1.Secret{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Secret",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      opts.secretName,
 			Namespace: "operator-ns",

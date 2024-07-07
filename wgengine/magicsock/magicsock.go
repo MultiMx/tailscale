@@ -7,6 +7,7 @@ package magicsock
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1154,7 +1155,8 @@ func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte) (s
 		return c.sendUDP(addr, b)
 	}
 
-	ch := c.derpWriteChanOfAddr(addr, pubKey)
+	regionID := int(addr.Port())
+	ch := c.derpWriteChanForRegion(regionID, pubKey)
 	if ch == nil {
 		metricSendDERPErrorChan.Add(1)
 		return false, nil
@@ -1165,8 +1167,7 @@ func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte) (s
 	// to derpWriteRequest and waited for derphttp.Client.Send to
 	// complete, but that's too slow while holding wireguard-go
 	// internal locks.
-	pkt := make([]byte, len(b))
-	copy(pkt, b)
+	pkt := bytes.Clone(b)
 
 	select {
 	case <-c.donec:
@@ -3027,6 +3028,17 @@ var (
 	// metricDERPHomeChange is how many times our DERP home region DI has
 	// changed from non-zero to a different non-zero.
 	metricDERPHomeChange = clientmetric.NewCounter("derp_home_change")
+
+	// metricDERPHomeNoChangeNoControl is how many times our DERP home
+	// region did not change because we didn't have an active connection to
+	// the control server.
+	metricDERPHomeNoChangeNoControl = clientmetric.NewCounter("derp_home_no_change_no_control")
+
+	// metricDERPHomeFallback is how many times we picked a DERP fallback.
+	metricDERPHomeFallback = clientmetric.NewCounter("derp_home_fallback")
+
+	// metricDERPStaleCleaned is how many times we closed a stale DERP connection.
+	metricDERPStaleCleaned = clientmetric.NewCounter("derp_stale_cleaned")
 
 	// Disco packets received bpf read path
 	//lint:ignore U1000 used on Linux only
