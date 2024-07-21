@@ -6,6 +6,11 @@
 package magicsock
 
 import (
+	"log"
+	"net/netip"
+	"strings"
+	"sync"
+
 	"tailscale.com/envknob"
 )
 
@@ -68,3 +73,25 @@ var (
 // checked every time at runtime, because tests set this after program
 // startup.
 func inTest() bool { return envknob.Bool("IN_TS_TEST") }
+
+// pretendpoints returns TS_DEBUG_PRETENDPOINT as []AddrPort, if set.
+// See https://github.com/tailscale/tailscale/issues/12578 and
+// https://github.com/tailscale/tailscale/pull/12735.
+//
+// It can be between 0 and 3 comma-separated AddrPorts.
+var pretendpoints = sync.OnceValue(func() (ret []netip.AddrPort) {
+	all := envknob.String("TS_DEBUG_PRETENDPOINT")
+	const max = 3
+	remain := all
+	for remain != "" && len(ret) < max {
+		var s string
+		s, remain, _ = strings.Cut(remain, ",")
+		ap, err := netip.ParseAddrPort(s)
+		if err != nil {
+			log.Printf("ignoring invalid AddrPort %q in TS_DEBUG_PRETENDPOINT %q: %v", s, all, err)
+			continue
+		}
+		ret = append(ret, ap)
+	}
+	return
+})

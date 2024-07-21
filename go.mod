@@ -4,7 +4,6 @@ go 1.22.0
 
 require (
 	filippo.io/mkcert v1.4.4
-	fybrik.io/crdoc v0.6.3
 	github.com/akutz/memconn v0.1.0
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa
 	github.com/andybalholm/brotli v1.1.0
@@ -20,7 +19,6 @@ require (
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
 	github.com/creack/pty v1.1.21
 	github.com/dave/courtney v0.4.0
-	github.com/dave/jennifer v1.7.0
 	github.com/dave/patsy v0.0.0-20210517141501-957256f50cba
 	github.com/dblohm7/wingoes v0.0.0-20240119213807-a09d6be7affa
 	github.com/digitalocean/go-smbios v0.0.0-20180907143718-390a4f403a8e
@@ -30,7 +28,7 @@ require (
 	github.com/evanw/esbuild v0.19.11
 	github.com/frankban/quicktest v1.14.6
 	github.com/fxamacker/cbor/v2 v2.6.0
-	github.com/gaissmai/bart v0.4.1
+	github.com/gaissmai/bart v0.11.1
 	github.com/go-json-experiment/json v0.0.0-20231102232822-2e55bd4e08b0
 	github.com/go-logr/zapr v1.3.0
 	github.com/go-ole/go-ole v1.3.0
@@ -44,7 +42,6 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/goreleaser/nfpm/v2 v2.33.1
 	github.com/hdevalence/ed25519consensus v0.2.0
-	github.com/iancoleman/strcase v0.3.0
 	github.com/illarion/gonotify v1.0.1
 	github.com/inetaf/tcpproxy v0.0.0-20240214030015-3ce58045626c
 	github.com/insomniacslk/dhcp v0.0.0-20231206064809-8c70d406f6d2
