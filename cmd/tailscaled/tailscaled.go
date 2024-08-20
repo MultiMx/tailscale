@@ -35,6 +35,7 @@ import (
 	"tailscale.com/control/controlclient"
 	"tailscale.com/drive/driveimpl"
 	"tailscale.com/envknob"
+	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/conffile"
 	"tailscale.com/ipn/ipnlocal"
@@ -154,9 +155,11 @@ var beCLI func() // non-nil if CLI is linked in
 func main() {
 	envknob.PanicIfAnyEnvCheckedInInit()
 	envknob.ApplyDiskConfig()
+	applyIntegrationTestEnvKnob()
 
+	defaultVerbosity := envknob.RegisterInt("TS_LOG_VERBOSITY")
 	printVersion := false
-	flag.IntVar(&args.verbose, "verbose", 0, "log verbosity level; 0 is default, 1 or higher are increasingly verbose")
+	flag.IntVar(&args.verbose, "verbose", defaultVerbosity(), "log verbosity level; 0 is default, 1 or higher are increasingly verbose")
 	flag.BoolVar(&args.cleanUp, "cleanup", false, "clean up system state and exit")
 	flag.StringVar(&args.debug, "debug", "", "listen address ([ip]:port) of optional debug server")
 	flag.StringVar(&args.socksAddr, "socks5-server", "", `optional [ip]:port to run a SOCK5 server (e.g. "localhost:1080")`)
@@ -394,7 +397,7 @@ func run() (err error) {
 	// Always clean up, even if we're going to run the server. This covers cases
 	// such as when a system was rebooted without shutting down, or tailscaled
 	// crashed, and would for example restore system DNS configuration.
-	dns.CleanUp(logf, netMon, args.tunname)
+	dns.CleanUp(logf, netMon, sys.HealthTracker(), args.tunname)
 	router.CleanUp(logf, netMon, args.tunname)
 	// If the cleanUp flag was passed, then exit.
 	if args.cleanUp {
@@ -894,4 +897,25 @@ func dieOnPipeReadErrorOfFD(fd int) {
 	f := os.NewFile(uintptr(fd), "TS_PARENT_DEATH_FD")
 	f.Read(make([]byte, 1))
 	os.Exit(1)
+}
+
+// applyIntegrationTestEnvKnob applies the tailscaled.env=... environment
+// variables specified on the Linux kernel command line, if the VM is being
+// run in NATLab integration tests.
+//
+// They're specified as: tailscaled.env=FOO=bar tailscaled.env=BAR=baz
+func applyIntegrationTestEnvKnob() {
+	if runtime.GOOS != "linux" || !hostinfo.IsNATLabGuestVM() {
+		return
+	}
+	cmdLine, _ := os.ReadFile("/proc/cmdline")
+	for _, s := range strings.Fields(string(cmdLine)) {
+		suf, ok := strings.CutPrefix(s, "tailscaled.env=")
+		if !ok {
+			continue
+		}
+		if k, v, ok := strings.Cut(suf, "="); ok {
+			envknob.Setenv(k, v)
+		}
+	}
 }

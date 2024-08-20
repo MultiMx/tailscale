@@ -13,6 +13,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"strings"
 	"testing"
@@ -494,6 +496,25 @@ func TestStdHandler(t *testing.T) {
 		},
 
 		{
+			name:     "inner_cancelled",
+			rh:       handlerErr(0, context.Canceled), // return canceled error, but the request was not cancelled
+			r:        req(bgCtx, "http://example.com/"),
+			wantCode: 500,
+			wantLog: AccessLogRecord{
+				Time:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				TLS:        false,
+				Host:       "example.com",
+				Method:     "GET",
+				Code:       500,
+				Err:        "context canceled",
+				RequestURI: "/",
+			},
+			wantBody: "Internal Server Error\n",
+		},
+
+		{
 			name: "nested",
 			rh: ReturnHandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 				// Here we completely handle the web response with an
@@ -705,6 +726,7 @@ func TestStdHandler_Canceled(t *testing.T) {
 			close(handlerOpen)
 			ctx := r.Context()
 			<-ctx.Done()
+			w.WriteHeader(200) // Ignored.
 			return ctx.Err()
 		}),
 		HandlerOptions{
@@ -718,6 +740,8 @@ func TestStdHandler_Canceled(t *testing.T) {
 			},
 		},
 	)
+	s := httptest.NewServer(h)
+	t.Cleanup(s.Close)
 
 	// Create a context which gets canceled after the handler starts processing
 	// the request.
@@ -726,9 +750,6 @@ func TestStdHandler_Canceled(t *testing.T) {
 		<-handlerOpen
 		cancelReq()
 	}()
-
-	s := httptest.NewServer(h)
-	t.Cleanup(s.Close)
 
 	// Send a request to our server.
 	req, err := http.NewRequestWithContext(ctx, httpm.GET, s.URL, nil)
@@ -766,7 +787,175 @@ func TestStdHandler_Canceled(t *testing.T) {
 	if e != nil {
 		t.Errorf("got OnError callback with %#v, want no callback", e)
 	}
+}
 
+func TestStdHandler_CanceledAfterHeader(t *testing.T) {
+	now := time.Now()
+
+	r := make(chan AccessLogRecord)
+	var e *HTTPError
+	handlerOpen := make(chan struct{})
+	h := StdHandler(
+		ReturnHandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			w.WriteHeader(http.StatusNoContent)
+			close(handlerOpen)
+			ctx := r.Context()
+			<-ctx.Done()
+			return ctx.Err()
+		}),
+		HandlerOptions{
+			Logf: t.Logf,
+			Now:  func() time.Time { return now },
+			OnError: func(w http.ResponseWriter, r *http.Request, h HTTPError) {
+				e = &h
+			},
+			OnCompletion: func(_ *http.Request, alr AccessLogRecord) {
+				r <- alr
+			},
+		},
+	)
+	s := httptest.NewServer(h)
+	t.Cleanup(s.Close)
+
+	// Create a context which gets canceled after the handler starts processing
+	// the request.
+	ctx, cancelReq := context.WithCancel(context.Background())
+	go func() {
+		<-handlerOpen
+		cancelReq()
+	}()
+
+	// Send a request to our server.
+	req, err := http.NewRequestWithContext(ctx, httpm.GET, s.URL, nil)
+	if err != nil {
+		t.Fatalf("making request: %s", err)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("got error %v, want context.Canceled", err)
+	}
+	if res != nil {
+		t.Errorf("got response %#v, want nil", res)
+	}
+
+	// Check that we got the expected log record.
+	got := <-r
+	got.Seconds = 0
+	got.RemoteAddr = ""
+	got.Host = ""
+	got.UserAgent = ""
+	want := AccessLogRecord{
+		Time:       now,
+		Code:       499,
+		Method:     "GET",
+		Err:        "context canceled (original code 204)",
+		Proto:      "HTTP/1.1",
+		RequestURI: "/",
+	}
+	if d := cmp.Diff(want, got); d != "" {
+		t.Errorf("AccessLogRecord wrong (-want +got)\n%s", d)
+	}
+
+	// Check that we rendered no response to the client after
+	// logHandler.OnCompletion has been called.
+	if e != nil {
+		t.Errorf("got OnError callback with %#v, want no callback", e)
+	}
+}
+
+func TestStdHandler_ConnectionClosedDuringBody(t *testing.T) {
+	now := time.Now()
+
+	// Start a HTTP server that writes back zeros until the request is abandoned.
+	// We next put a reverse-proxy in front of this server.
+	rs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		zeroes := make([]byte, 1024)
+		for r.Context().Err() == nil {
+			w.Write(zeroes)
+		}
+	}))
+	defer rs.Close()
+
+	r := make(chan AccessLogRecord)
+	var e *HTTPError
+	responseStarted := make(chan struct{})
+	requestCanceled := make(chan struct{})
+
+	// Create another server which proxies our zeroes server.
+	// The [httputil.ReverseProxy] will panic with [http.ErrAbortHandler] when
+	// it fails to copy the response to the client.
+	h := StdHandler(
+		ReturnHandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			(&httputil.ReverseProxy{
+				Director: func(r *http.Request) {
+					r.URL = must.Get(url.Parse(rs.URL))
+				},
+			}).ServeHTTP(w, r)
+			return nil
+		}),
+		HandlerOptions{
+			Logf: t.Logf,
+			Now:  func() time.Time { return now },
+			OnError: func(w http.ResponseWriter, r *http.Request, h HTTPError) {
+				e = &h
+			},
+			OnCompletion: func(_ *http.Request, alr AccessLogRecord) {
+				r <- alr
+			},
+		},
+	)
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(responseStarted)
+		<-requestCanceled
+		h.ServeHTTP(w, r.WithContext(context.WithoutCancel(r.Context())))
+	}))
+	t.Cleanup(s.Close)
+
+	// Create a context which gets canceled after the handler starts processing
+	// the request.
+	ctx, cancelReq := context.WithCancel(context.Background())
+	go func() {
+		<-responseStarted
+		cancelReq()
+	}()
+
+	// Send a request to our server.
+	req, err := http.NewRequestWithContext(ctx, httpm.GET, s.URL, nil)
+	if err != nil {
+		t.Fatalf("making request: %s", err)
+	}
+	res, err := http.DefaultClient.Do(req)
+	close(requestCanceled)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("got error %v, want context.Canceled", err)
+	}
+	if res != nil {
+		t.Errorf("got response %#v, want nil", res)
+	}
+
+	// Check that we got the expected log record.
+	got := <-r
+	got.Seconds = 0
+	got.RemoteAddr = ""
+	got.Host = ""
+	got.UserAgent = ""
+	want := AccessLogRecord{
+		Time:       now,
+		Code:       499,
+		Method:     "GET",
+		Err:        "net/http: abort Handler (original code 200)",
+		Proto:      "HTTP/1.1",
+		RequestURI: "/",
+	}
+	if d := cmp.Diff(want, got, cmpopts.IgnoreFields(AccessLogRecord{}, "Bytes")); d != "" {
+		t.Errorf("AccessLogRecord wrong (-want +got)\n%s", d)
+	}
+
+	// Check that we rendered no response to the client after
+	// logHandler.OnCompletion has been called.
+	if e != nil {
+		t.Errorf("got OnError callback with %#v, want no callback", e)
+	}
 }
 
 func TestStdHandler_OnErrorPanic(t *testing.T) {
@@ -833,6 +1022,62 @@ func TestStdHandler_OnErrorPanic(t *testing.T) {
 		t.Errorf("got body %q, want %q", body, want)
 	}
 	res.Body.Close()
+}
+
+func TestLogHandler_QuietLogging(t *testing.T) {
+	now := time.Now()
+	var logs []string
+	logf := func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+
+	var done bool
+	onComp := func(r *http.Request, alr AccessLogRecord) {
+		if done {
+			t.Fatal("expected only one OnCompletion call")
+		}
+		done = true
+
+		want := AccessLogRecord{
+			Time:       now,
+			RemoteAddr: "192.0.2.1:1234",
+			Proto:      "HTTP/1.1",
+			Host:       "example.com",
+			Method:     "GET",
+			RequestURI: "/",
+			Code:       200,
+		}
+		if diff := cmp.Diff(want, alr); diff != "" {
+			t.Fatalf("unexpected OnCompletion AccessLogRecord (-want +got):\n%s", diff)
+		}
+	}
+
+	LogHandler(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(200)
+			w.WriteHeader(201) // loggingResponseWriter will write a warning.
+		}),
+		LogOptions{
+			Logf:         logf,
+			OnCompletion: onComp,
+			QuietLogging: true,
+			Now:          func() time.Time { return now },
+		},
+	).ServeHTTP(
+		httptest.NewRecorder(),
+		httptest.NewRequest("GET", "/", nil),
+	)
+
+	if !done {
+		t.Fatal("OnCompletion call didn't happen")
+	}
+
+	wantLogs := []string{
+		"[unexpected] HTTP handler set statusCode twice (200 and 201)",
+	}
+	if diff := cmp.Diff(wantLogs, logs); diff != "" {
+		t.Fatalf("logs (-want +got):\n%s", diff)
+	}
 }
 
 func TestErrorHandler_Panic(t *testing.T) {
@@ -1060,4 +1305,41 @@ func TestBucket(t *testing.T) {
 			}
 		})
 	}
+}
+
+func ExampleMiddlewareStack() {
+	// setHeader returns a middleware that sets header k = vs.
+	setHeader := func(k string, vs ...string) Middleware {
+		k = textproto.CanonicalMIMEHeaderKey(k)
+		return func(h http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header()[k] = vs
+				h.ServeHTTP(w, r)
+			})
+		}
+	}
+
+	// h is a http.Handler which prints the A, B & C response headers, wrapped
+	// in a few middleware which set those headers.
+	var h http.Handler = MiddlewareStack(
+		setHeader("A", "mw1"),
+		MiddlewareStack(
+			setHeader("A", "mw2.1"),
+			setHeader("B", "mw2.2"),
+			setHeader("C", "mw2.3"),
+			setHeader("C", "mw2.4"),
+		),
+		setHeader("B", "mw3"),
+	)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("A", w.Header().Get("A"))
+		fmt.Println("B", w.Header().Get("B"))
+		fmt.Println("C", w.Header().Get("C"))
+	}))
+
+	// Invoke the handler.
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("", "/", nil))
+	// Output:
+	// A mw2.1
+	// B mw3
+	// C mw2.4
 }

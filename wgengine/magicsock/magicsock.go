@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -24,7 +25,6 @@ import (
 
 	"github.com/tailscale/wireguard-go/conn"
 	"go4.org/mem"
-	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 
 	"tailscale.com/control/controlknobs"
@@ -131,6 +131,9 @@ type Conn struct {
 
 	// bind is the wireguard-go conn.Bind for Conn.
 	bind *connBind
+
+	// cloudInfo is used to query cloud metadata services.
+	cloudInfo *cloudInfo
 
 	// ============================================================
 	// Fields that must be accessed via atomic load/stores.
@@ -311,6 +314,12 @@ type Conn struct {
 	// lastEPERMRebind tracks the last time a rebind was performed
 	// after experiencing a syscall.EPERM.
 	lastEPERMRebind syncs.AtomicValue[time.Time]
+
+	// staticEndpoints are user set endpoints that this node should
+	// advertise amongst its wireguard endpoints. It is user's
+	// responsibility to ensure that traffic from these endpoints is routed
+	// to the node.
+	staticEndpoints views.Slice[netip.AddrPort]
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -418,9 +427,10 @@ func (o *Options) derpActiveFunc() func() {
 
 // newConn is the error-free, network-listening-side-effect-free based
 // of NewConn. Mostly for tests.
-func newConn() *Conn {
+func newConn(logf logger.Logf) *Conn {
 	discoPrivate := key.NewDisco()
 	c := &Conn{
+		logf:         logf,
 		derpRecvCh:   make(chan derpReadResult, 1), // must be buffered, see issue 3736
 		derpStarted:  make(chan struct{}),
 		peerLastDerp: make(map[key.NodePublic]int),
@@ -428,6 +438,7 @@ func newConn() *Conn {
 		discoInfo:    make(map[key.DiscoPublic]*discoInfo),
 		discoPrivate: discoPrivate,
 		discoPublic:  discoPrivate.Public(),
+		cloudInfo:    newCloudInfo(logf),
 	}
 	c.discoShort = c.discoPublic.ShortString()
 	c.bind = &connBind{Conn: c, closed: true}
@@ -455,10 +466,9 @@ func NewConn(opts Options) (*Conn, error) {
 		return nil, errors.New("magicsock.Options.NetMon must be non-nil")
 	}
 
-	c := newConn()
+	c := newConn(opts.logf())
 	c.port.Store(uint32(opts.Port))
 	c.controlKnobs = opts.ControlKnobs
-	c.logf = opts.logf()
 	c.epFunc = opts.endpointsFunc()
 	c.derpActiveFunc = opts.derpActiveFunc()
 	c.idleFunc = opts.IdleFunc
@@ -634,6 +644,22 @@ func (c *Conn) setEndpoints(endpoints []tailcfg.Endpoint) (changed bool) {
 	}
 	c.lastEndpoints = endpoints
 	return true
+}
+
+// SetStaticEndpoints sets static endpoints to the provided value and triggers
+// an asynchronous update of the endpoints that this node advertises.
+// Static endpoints are endpoints explicitly configured by user.
+func (c *Conn) SetStaticEndpoints(ep views.Slice[netip.AddrPort]) {
+	c.mu.Lock()
+	if reflect.DeepEqual(c.staticEndpoints.AsSlice(), ep.AsSlice()) {
+		return
+	}
+	c.staticEndpoints = ep
+	c.mu.Unlock()
+	// Technically this is not a reSTUNning, but ReSTUN does what we need at
+	// this point- calls updateEndpoints or queues an update if there is
+	// already an in-progress update.
+	c.ReSTUN("static-endpoint-change")
 }
 
 // setNetInfoHavePortMap updates NetInfo.HavePortMap to true.
@@ -845,8 +871,10 @@ func (c *Conn) DiscoPublicKey() key.DiscoPublic {
 	return c.discoPublic
 }
 
-// determineEndpoints returns the machine's endpoint addresses. It
-// does a STUN lookup (via netcheck) to determine its public address.
+// determineEndpoints returns the machine's endpoint addresses. It does a STUN
+// lookup (via netcheck) to determine its public address. Additionally any
+// static enpoints provided by user are always added to the returned endpoints
+// without validating if the node can be reached via those endpoints.
 //
 // c.mu must NOT be held.
 func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, error) {
@@ -927,6 +955,27 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 		addAddr(ap, tailcfg.EndpointExplicitConf)
 	}
 
+	// If we're on a cloud instance, we might have a public IPv4 or IPv6
+	// address that we can be reached at. Find those, if they exist, and
+	// add them.
+	if addrs, err := c.cloudInfo.GetPublicIPs(ctx); err == nil {
+		var port4, port6 uint16
+		if addr := c.pconn4.LocalAddr(); addr != nil {
+			port4 = uint16(addr.Port)
+		}
+		if addr := c.pconn6.LocalAddr(); addr != nil {
+			port6 = uint16(addr.Port)
+		}
+
+		for _, addr := range addrs {
+			if addr.Is4() && port4 > 0 {
+				addAddr(netip.AddrPortFrom(addr, port4), tailcfg.EndpointLocal)
+			} else if addr.Is6() && port6 > 0 {
+				addAddr(netip.AddrPortFrom(addr, port6), tailcfg.EndpointLocal)
+			}
+		}
+	}
+
 	// Update our set of endpoints by adding any endpoints that we
 	// previously found but haven't expired yet. This also updates the
 	// cache with the set of endpoints discovered in this function.
@@ -942,6 +991,10 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 	// For now, though, rely on a minor LinkChange event causing this to
 	// re-run.
 	eps = c.endpointTracker.update(time.Now(), eps)
+
+	for i := range c.staticEndpoints.Len() {
+		addAddr(c.staticEndpoints.At(i), tailcfg.EndpointExplicitConf)
+	}
 
 	if localAddr := c.pconn4.LocalAddr(); localAddr.IP.IsUnspecified() {
 		ips, loopback, err := netmon.LocalAddresses()
@@ -1046,12 +1099,6 @@ var errDropDerpPacket = errors.New("too many DERP packets queued; dropping")
 var errNoUDP = errors.New("no UDP available on platform")
 
 var errUnsupportedConnType = errors.New("unsupported connection type")
-
-var (
-	// This acts as a compile-time check for our usage of ipv6.Message in
-	// batchingUDPConn for both IPv6 and IPv4 operations.
-	_ ipv6.Message = ipv4.Message{}
-)
 
 func (c *Conn) sendUDPBatch(addr netip.AddrPort, buffs [][]byte) (sent bool, err error) {
 	isIPv6 := false
@@ -1227,10 +1274,15 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
 	// epCache caches an IPPort->endpoint for hot flows.
 	var epCache ippEndpointCache
 
-	return func(buffs [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+	return func(buffs [][]byte, sizes []int, eps []conn.Endpoint) (_ int, retErr error) {
 		if healthItem != nil {
 			healthItem.Enter()
 			defer healthItem.Exit()
+			defer func() {
+				if retErr != nil {
+					c.logf("Receive func %s exiting with error: %T, %v", healthItem.Name(), retErr, retErr)
+				}
+			}()
 		}
 		if ruc == nil {
 			panic("nil RebindingUDPConn")
@@ -2359,6 +2411,8 @@ func (c *Conn) onPortMapChanged() { c.ReSTUN("portmap-changed") }
 
 // ReSTUN triggers an address discovery.
 // The provided why string is for debug logging only.
+// If Conn.staticEndpoints have been updated, calling ReSTUN will also result in
+// the new endpoints being advertised.
 func (c *Conn) ReSTUN(why string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2484,6 +2538,7 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 			}
 		}
 		trySetSocketBuffer(pconn, c.logf)
+		trySetUDPSocketOptions(pconn, c.logf)
 
 		// Success.
 		if debugBindSocket() {
@@ -2598,153 +2653,6 @@ func (c *Conn) ParseEndpoint(nodeKeyStr string) (conn.Endpoint, error) {
 	}
 
 	return ep, nil
-}
-
-func (c *batchingUDPConn) writeBatch(msgs []ipv6.Message) error {
-	var head int
-	for {
-		n, err := c.xpc.WriteBatch(msgs[head:], 0)
-		if err != nil || n == len(msgs[head:]) {
-			// Returning the number of packets written would require
-			// unraveling individual msg len and gso size during a coalesced
-			// write. The top of the call stack disregards partial success,
-			// so keep this simple for now.
-			return err
-		}
-		head += n
-	}
-}
-
-// splitCoalescedMessages splits coalesced messages from the tail of dst
-// beginning at index 'firstMsgAt' into the head of the same slice. It reports
-// the number of elements to evaluate in msgs for nonzero len (msgs[i].N). An
-// error is returned if a socket control message cannot be parsed or a split
-// operation would overflow msgs.
-func (c *batchingUDPConn) splitCoalescedMessages(msgs []ipv6.Message, firstMsgAt int) (n int, err error) {
-	for i := firstMsgAt; i < len(msgs); i++ {
-		msg := &msgs[i]
-		if msg.N == 0 {
-			return n, err
-		}
-		var (
-			gsoSize    int
-			start      int
-			end        = msg.N
-			numToSplit = 1
-		)
-		gsoSize, err = c.getGSOSizeFromControl(msg.OOB[:msg.NN])
-		if err != nil {
-			return n, err
-		}
-		if gsoSize > 0 {
-			numToSplit = (msg.N + gsoSize - 1) / gsoSize
-			end = gsoSize
-		}
-		for j := 0; j < numToSplit; j++ {
-			if n > i {
-				return n, errors.New("splitting coalesced packet resulted in overflow")
-			}
-			copied := copy(msgs[n].Buffers[0], msg.Buffers[0][start:end])
-			msgs[n].N = copied
-			msgs[n].Addr = msg.Addr
-			start = end
-			end += gsoSize
-			if end > msg.N {
-				end = msg.N
-			}
-			n++
-		}
-		if i != n-1 {
-			// It is legal for bytes to move within msg.Buffers[0] as a result
-			// of splitting, so we only zero the source msg len when it is not
-			// the destination of the last split operation above.
-			msg.N = 0
-		}
-	}
-	return n, nil
-}
-
-func (c *batchingUDPConn) ReadBatch(msgs []ipv6.Message, flags int) (n int, err error) {
-	if !c.rxOffload || len(msgs) < 2 {
-		return c.xpc.ReadBatch(msgs, flags)
-	}
-	// Read into the tail of msgs, split into the head.
-	readAt := len(msgs) - 2
-	numRead, err := c.xpc.ReadBatch(msgs[readAt:], 0)
-	if err != nil || numRead == 0 {
-		return 0, err
-	}
-	return c.splitCoalescedMessages(msgs, readAt)
-}
-
-func (c *batchingUDPConn) LocalAddr() net.Addr {
-	return c.pc.LocalAddr().(*net.UDPAddr)
-}
-
-func (c *batchingUDPConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
-	return c.pc.WriteToUDPAddrPort(b, addr)
-}
-
-func (c *batchingUDPConn) Close() error {
-	return c.pc.Close()
-}
-
-// tryUpgradeToBatchingUDPConn probes the capabilities of the OS and pconn, and
-// upgrades pconn to a *batchingUDPConn if appropriate.
-func tryUpgradeToBatchingUDPConn(pconn nettype.PacketConn, network string, batchSize int) nettype.PacketConn {
-	if network != "udp4" && network != "udp6" {
-		return pconn
-	}
-	if runtime.GOOS != "linux" {
-		return pconn
-	}
-	if strings.HasPrefix(hostinfo.GetOSVersion(), "2.") {
-		// recvmmsg/sendmmsg were added in 2.6.33, but we support down to
-		// 2.6.32 for old NAS devices. See https://github.com/tailscale/tailscale/issues/6807.
-		// As a cheap heuristic: if the Linux kernel starts with "2", just
-		// consider it too old for mmsg. Nobody who cares about performance runs
-		// such ancient kernels. UDP offload was added much later, so no
-		// upgrades are available.
-		return pconn
-	}
-	uc, ok := pconn.(*net.UDPConn)
-	if !ok {
-		return pconn
-	}
-	b := &batchingUDPConn{
-		pc:                    pconn,
-		getGSOSizeFromControl: getGSOSizeFromControl,
-		setGSOSizeInControl:   setGSOSizeInControl,
-		sendBatchPool: sync.Pool{
-			New: func() any {
-				ua := &net.UDPAddr{
-					IP: make([]byte, 16),
-				}
-				msgs := make([]ipv6.Message, batchSize)
-				for i := range msgs {
-					msgs[i].Buffers = make([][]byte, 1)
-					msgs[i].Addr = ua
-					msgs[i].OOB = make([]byte, controlMessageSize)
-				}
-				return &sendBatch{
-					ua:   ua,
-					msgs: msgs,
-				}
-			},
-		},
-	}
-	switch network {
-	case "udp4":
-		b.xpc = ipv4.NewPacketConn(uc)
-	case "udp6":
-		b.xpc = ipv6.NewPacketConn(uc)
-	default:
-		panic("bogus network")
-	}
-	var txOffload bool
-	txOffload, b.rxOffload = tryEnableUDPOffload(uc)
-	b.txOffload.Store(txOffload)
-	return b
 }
 
 func newBlockForeverConn() *blockForeverConn {

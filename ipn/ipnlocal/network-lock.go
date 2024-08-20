@@ -27,6 +27,7 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
+	"tailscale.com/tsconst"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
@@ -254,7 +255,10 @@ func (b *LocalBackend) tkaSyncIfNeeded(nm *netmap.NetworkMap, prefs ipn.PrefsVie
 		b.logf("tkaSyncIfNeeded: enabled=%v, head=%v", nm.TKAEnabled, nm.TKAHead)
 	}
 
-	ourNodeKey := prefs.Persist().PublicNodeKey()
+	ourNodeKey, ok := prefs.Persist().PublicNodeKeyOK()
+	if !ok {
+		return errors.New("tkaSyncIfNeeded: no node key in prefs")
+	}
 
 	isEnabled := b.tka != nil
 	wantEnabled := nm.TKAEnabled
@@ -716,7 +720,7 @@ func (b *LocalBackend) NetworkLockSign(nodeKey key.NodePublic, rotationPublic []
 			return key.NodePublic{}, tka.NodeKeySignature{}, errNetworkLockNotActive
 		}
 		if !b.tka.authority.KeyTrusted(nlPriv.KeyID()) {
-			return key.NodePublic{}, tka.NodeKeySignature{}, errors.New("this node is not trusted by network lock")
+			return key.NodePublic{}, tka.NodeKeySignature{}, errors.New(tsconst.TailnetLockNotTrustedMsg)
 		}
 
 		p, err := nodeKey.MarshalBinary()
