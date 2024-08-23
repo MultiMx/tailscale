@@ -26,7 +26,7 @@ jobs:
           out-file-path: './build/'
 
       - name: Build Binary
-        run: ./build/release ./cmd/derper -c tar.gz --extra-arches --output build/output --perm 777
+        run: ./build/release ./cmd/derper -c tar.gz --extra-arches --output build/output -j 1 --perm 777
 
       - name: Upload Release
         uses: softprops/action-gh-release@v2
