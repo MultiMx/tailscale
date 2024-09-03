@@ -95,11 +95,29 @@ func findKernelPath(goMod string) (string, error) {
 
 type addNodeFunc func(c *vnet.Config) *vnet.Node // returns nil to omit test
 
+func v6cidr(n int) string {
+	return fmt.Sprintf("2000:%d::1/64", n)
+}
+
 func easy(c *vnet.Config) *vnet.Node {
 	n := c.NumNodes() + 1
 	return c.AddNode(c.AddNetwork(
 		fmt.Sprintf("2.%d.%d.%d", n, n, n), // public IP
 		fmt.Sprintf("192.168.%d.1/24", n), vnet.EasyNAT))
+}
+
+func easyAnd6(c *vnet.Config) *vnet.Node {
+	n := c.NumNodes() + 1
+	return c.AddNode(c.AddNetwork(
+		fmt.Sprintf("2.%d.%d.%d", n, n, n), // public IP
+		fmt.Sprintf("192.168.%d.1/24", n),
+		v6cidr(n),
+		vnet.EasyNAT))
+}
+
+func just6(c *vnet.Config) *vnet.Node {
+	n := c.NumNodes() + 1
+	return c.AddNode(c.AddNetwork(v6cidr(n))) // public IPv6 prefix
 }
 
 // easy + host firewall
@@ -192,21 +210,24 @@ func hardPMP(c *vnet.Config) *vnet.Node {
 		fmt.Sprintf("10.7.%d.1/24", n), vnet.HardNAT, vnet.NATPMP))
 }
 
-func (nt *natTest) runTest(node1, node2 addNodeFunc) pingRoute {
+func (nt *natTest) runTest(addNode ...addNodeFunc) pingRoute {
+	if len(addNode) < 1 || len(addNode) > 2 {
+		nt.tb.Fatalf("runTest: invalid number of nodes %v; want 1 or 2", len(addNode))
+	}
 	t := nt.tb
 
 	var c vnet.Config
 	c.SetPCAPFile(*pcapFile)
-	nodes := []*vnet.Node{
-		node1(&c),
-		node2(&c),
-	}
-	if nodes[0] == nil || nodes[1] == nil {
-		t.Skip("skipping test; not applicable combination")
-	}
-	if *logTailscaled {
-		nodes[0].SetVerboseSyslog(true)
-		nodes[1].SetVerboseSyslog(true)
+	nodes := []*vnet.Node{}
+	for _, fn := range addNode {
+		node := fn(&c)
+		if node == nil {
+			t.Skip("skipping test; not applicable combination")
+		}
+		nodes = append(nodes, node)
+		if *logTailscaled {
+			node.SetVerboseSyslog(true)
+		}
 	}
 
 	var err error
@@ -255,6 +276,11 @@ func (nt *natTest) runTest(node1, node2 addNodeFunc) pingRoute {
 		for _, e := range node.Env() {
 			fmt.Fprintf(&envBuf, " tailscaled.env=%s=%s", e.Key, e.Value)
 		}
+		sysLogAddr := net.JoinHostPort(vnet.FakeSyslogIPv4().String(), "995")
+		if node.IsV6Only() {
+			fmt.Fprintf(&envBuf, " tta.nameserver=%s", vnet.FakeDNSIPv6())
+			sysLogAddr = net.JoinHostPort(vnet.FakeSyslogIPv6().String(), "995")
+		}
 		envStr := envBuf.String()
 
 		cmd := exec.Command("qemu-system-x86_64",
@@ -262,7 +288,7 @@ func (nt *natTest) runTest(node1, node2 addNodeFunc) pingRoute {
 			"-m", "384M",
 			"-nodefaults", "-no-user-config", "-nographic",
 			"-kernel", nt.kernel,
-			"-append", "console=hvc0 root=PARTUUID=60c24cc1-f3f9-427a-8199-76baa2d60001/PARTNROFF=1 ro init=/gokrazy/init panic=10 oops=panic pci=off nousb tsc=unstable clocksource=hpet gokrazy.remote_syslog.target=52.52.0.9:995 tailscale-tta=1"+envStr,
+			"-append", "console=hvc0 root=PARTUUID=60c24cc1-f3f9-427a-8199-76baa2d60001/PARTNROFF=1 ro init=/gokrazy/init panic=10 oops=panic pci=off nousb tsc=unstable clocksource=hpet gokrazy.remote_syslog.target="+sysLogAddr+" tailscale-tta=1"+envStr,
 			"-drive", "id=blk0,file="+disk+",format=qcow2",
 			"-device", "virtio-blk-device,drive=blk0",
 			"-netdev", "stream,id=net0,addr.type=unix,addr.path="+sockAddr,
@@ -287,16 +313,18 @@ func (nt *natTest) runTest(node1, node2 addNodeFunc) pingRoute {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	lc1 := nt.vnet.NodeAgentClient(nodes[0])
-	lc2 := nt.vnet.NodeAgentClient(nodes[1])
-	clients := []*vnet.NodeAgentClient{lc1, lc2}
+	var clients []*vnet.NodeAgentClient
+	for _, n := range nodes {
+		clients = append(clients, nt.vnet.NodeAgentClient(n))
+	}
+	sts := make([]*ipnstate.Status, len(nodes))
 
 	var eg errgroup.Group
-	var sts [2]*ipnstate.Status
 	for i, c := range clients {
 		i, c := i, c
 		eg.Go(func() error {
 			node := nodes[i]
+			t.Logf("%v calling Status...", node)
 			st, err := c.Status(ctx)
 			if err != nil {
 				return fmt.Errorf("%v status: %w", node, err)
@@ -334,7 +362,11 @@ func (nt *natTest) runTest(node1, node2 addNodeFunc) pingRoute {
 
 	defer nt.vnet.Close()
 
-	pingRes, err := ping(ctx, lc1, sts[1].Self.TailscaleIPs[0])
+	if len(nodes) < 2 {
+		return ""
+	}
+
+	pingRes, err := ping(ctx, clients[0], sts[1].Self.TailscaleIPs[0])
 	if err != nil {
 		t.Fatalf("ping failure: %v", err)
 	}
@@ -442,6 +474,23 @@ func (nt *natTest) want(r pingRoute) {
 func TestEasyEasy(t *testing.T) {
 	nt := newNatTest(t)
 	nt.runTest(easy, easy)
+	nt.want(routeDirect)
+}
+
+func TestSingleJustIPv6(t *testing.T) {
+	nt := newNatTest(t)
+	nt.runTest(just6)
+}
+
+func TestJustIPv6(t *testing.T) {
+	nt := newNatTest(t)
+	nt.runTest(just6, just6)
+	nt.want(routeDirect)
+}
+
+func TestEasy4AndJust6(t *testing.T) {
+	nt := newNatTest(t)
+	nt.runTest(easyAnd6, just6)
 	nt.want(routeDirect)
 }
 
