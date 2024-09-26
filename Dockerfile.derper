@@ -2,10 +2,9 @@ FROM alpine:latest
 ARG TARGETOS
 ARG TARGETARCH
 
-COPY /build/output/derper_${TARGETOS}_${TARGETARCH} /usr/bin/runner
-
-RUN chmod +x /usr/bin/runner
+COPY /build/output/derper_${TARGETOS}_${TARGETARCH} /usr/bin/derper
+RUN chmod +x /usr/bin/derper
 
 WORKDIR /data
 
-ENTRYPOINT [ "/usr/bin/runner" ]
+ENTRYPOINT [ "/usr/bin/derper" ]
