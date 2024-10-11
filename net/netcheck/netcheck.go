@@ -503,6 +503,10 @@ func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *netmon.State) (plan prob
 	plan = make(probePlan)
 
 	for _, reg := range dm.Regions {
+		if len(reg.Nodes) == 0 {
+			continue
+		}
+
 		var p4 []probe
 		var p6 []probe
 		for try := 0; try < 3; try++ {
@@ -936,7 +940,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 			}
 		}
 		if len(need) > 0 {
-			if !opts.OnlyTCP443 {
+			if opts == nil || !opts.OnlyTCP443 {
 				// Kick off ICMP in parallel to HTTPS checks; we don't
 				// reuse the same WaitGroup for those probes because we
 				// need to close the underlying Pinger after a timeout

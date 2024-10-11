@@ -132,35 +132,9 @@ func newNetfilterRunner(logf logger.Logf) (linuxfw.NetfilterRunner, error) {
 func main() {
 	log.SetPrefix("boot: ")
 	tailscale.I_Acknowledge_This_API_Is_Unstable = true
-	cfg := &settings{
-		AuthKey:                               defaultEnvs([]string{"TS_AUTHKEY", "TS_AUTH_KEY"}, ""),
-		Hostname:                              defaultEnv("TS_HOSTNAME", ""),
-		Routes:                                defaultEnvStringPointer("TS_ROUTES"),
-		ServeConfigPath:                       defaultEnv("TS_SERVE_CONFIG", ""),
-		ProxyTargetIP:                         defaultEnv("TS_DEST_IP", ""),
-		ProxyTargetDNSName:                    defaultEnv("TS_EXPERIMENTAL_DEST_DNS_NAME", ""),
-		TailnetTargetIP:                       defaultEnv("TS_TAILNET_TARGET_IP", ""),
-		TailnetTargetFQDN:                     defaultEnv("TS_TAILNET_TARGET_FQDN", ""),
-		DaemonExtraArgs:                       defaultEnv("TS_TAILSCALED_EXTRA_ARGS", ""),
-		ExtraArgs:                             defaultEnv("TS_EXTRA_ARGS", ""),
-		InKubernetes:                          os.Getenv("KUBERNETES_SERVICE_HOST") != "",
-		UserspaceMode:                         defaultBool("TS_USERSPACE", true),
-		StateDir:                              defaultEnv("TS_STATE_DIR", ""),
-		AcceptDNS:                             defaultEnvBoolPointer("TS_ACCEPT_DNS"),
-		KubeSecret:                            defaultEnv("TS_KUBE_SECRET", "tailscale"),
-		SOCKSProxyAddr:                        defaultEnv("TS_SOCKS5_SERVER", ""),
-		HTTPProxyAddr:                         defaultEnv("TS_OUTBOUND_HTTP_PROXY_LISTEN", ""),
-		Socket:                                defaultEnv("TS_SOCKET", "/tmp/tailscaled.sock"),
-		AuthOnce:                              defaultBool("TS_AUTH_ONCE", false),
-		Root:                                  defaultEnv("TS_TEST_ONLY_ROOT", "/"),
-		TailscaledConfigFilePath:              tailscaledConfigFilePath(),
-		AllowProxyingClusterTrafficViaIngress: defaultBool("EXPERIMENTAL_ALLOW_PROXYING_CLUSTER_TRAFFIC_VIA_INGRESS", false),
-		PodIP:                                 defaultEnv("POD_IP", ""),
-		EnableForwardingOptimizations:         defaultBool("TS_EXPERIMENTAL_ENABLE_FORWARDING_OPTIMIZATIONS", false),
-		HealthCheckAddrPort:                   defaultEnv("TS_HEALTHCHECK_ADDR_PORT", ""),
-	}
 
-	if err := cfg.validate(); err != nil {
+	cfg, err := configFromEnv()
+	if err != nil {
 		log.Fatalf("invalid configuration: %v", err)
 	}
 
@@ -275,10 +249,8 @@ authLoop:
 			switch *n.State {
 			case ipn.NeedsLogin:
 				if isOneStepConfig(cfg) {
-					// This could happen if this is the
-					// first time tailscaled was run for
-					// this device and the auth key was not
-					// passed via the configfile.
+					// This could happen if this is the first time tailscaled was run for this
+					// device and the auth key was not passed via the configfile.
 					log.Fatalf("invalid state: tailscaled daemon started with a config file, but tailscale is not logged in: ensure you pass a valid auth key in the config file.")
 				}
 				if err := authTailscale(); err != nil {
@@ -376,6 +348,9 @@ authLoop:
 			}
 		})
 	)
+	// egressSvcsErrorChan will get an error sent to it if this containerboot instance is configured to expose 1+
+	// egress services in HA mode and errored.
+	var egressSvcsErrorChan = make(chan error)
 	defer t.Stop()
 	// resetTimer resets timer for when to next attempt to resolve the DNS
 	// name for the proxy configured with TS_EXPERIMENTAL_DEST_DNS_NAME. The
@@ -401,6 +376,7 @@ authLoop:
 		failedResolveAttempts++
 	}
 
+	var egressSvcsNotify chan ipn.Notify
 	notifyChan := make(chan ipn.Notify)
 	errChan := make(chan error)
 	go func() {
@@ -478,7 +454,11 @@ runLoop:
 					egressAddrs = node.Addresses().AsSlice()
 					newCurentEgressIPs = deephash.Hash(&egressAddrs)
 					egressIPsHaveChanged = newCurentEgressIPs != currentEgressIPs
-					if egressIPsHaveChanged && len(egressAddrs) != 0 {
+					// The firewall rules get (re-)installed:
+					// - on startup
+					// - when the tailnet IPs of the tailnet target have changed
+					// - when the tailnet IPs of this node have changed
+					if (egressIPsHaveChanged || ipsHaveChanged) && len(egressAddrs) != 0 {
 						var rulesInstalled bool
 						for _, egressAddr := range egressAddrs {
 							ea := egressAddr.Addr()
@@ -575,31 +555,50 @@ runLoop:
 					h.Unlock()
 					healthzRunner()
 				}
+				if egressSvcsNotify != nil {
+					egressSvcsNotify <- n
+				}
 			}
 			if !startupTasksDone {
-				// For containerboot instances that act as TCP
-				// proxies (proxying traffic to an endpoint
-				// passed via one of the env vars that
-				// containerbot reads) and store state in a
-				// Kubernetes Secret, we consider startup tasks
-				// done at the point when device info has been
-				// successfully stored to state Secret.
-				// For all other containerboot instances, if we
-				// just get to this point the startup tasks can
-				// be considered done.
+				// For containerboot instances that act as TCP proxies (proxying traffic to an endpoint
+				// passed via one of the env vars that containerboot reads) and store state in a
+				// Kubernetes Secret, we consider startup tasks done at the point when device info has
+				// been successfully stored to state Secret. For all other containerboot instances, if
+				// we just get to this point the startup tasks can be considered done.
 				if !isL3Proxy(cfg) || !hasKubeStateStore(cfg) || (currentDeviceEndpoints != deephash.Sum{} && currentDeviceID != deephash.Sum{}) {
 					// This log message is used in tests to detect when all
 					// post-auth configuration is done.
 					log.Println("Startup complete, waiting for shutdown signal")
 					startupTasksDone = true
 
-					// Wait on tailscaled process. It won't
-					// be cleaned up by default when the
-					// container exits as it is not PID1.
-					// TODO (irbekrm): perhaps we can
-					// replace the reaper by a running
-					// cmd.Wait in a goroutine immediately
-					// after starting tailscaled?
+					// Configure egress proxy. Egress proxy will set up firewall rules to proxy
+					// traffic to tailnet targets configured in the provided configuration file. It
+					// will then continuously monitor the config file and netmap updates and
+					// reconfigure the firewall rules as needed. If any of its operations fail, it
+					// will crash this node.
+					if cfg.EgressSvcsCfgPath != "" {
+						log.Printf("configuring egress proxy using configuration file at %s", cfg.EgressSvcsCfgPath)
+						egressSvcsNotify = make(chan ipn.Notify)
+						ep := egressProxy{
+							cfgPath:      cfg.EgressSvcsCfgPath,
+							nfr:          nfr,
+							kc:           kc,
+							stateSecret:  cfg.KubeSecret,
+							netmapChan:   egressSvcsNotify,
+							podIPv4:      cfg.PodIPv4,
+							tailnetAddrs: addrs,
+						}
+						go func() {
+							if err := ep.run(ctx, n); err != nil {
+								egressSvcsErrorChan <- err
+							}
+						}()
+					}
+
+					// Wait on tailscaled process. It won't be cleaned up by default when the
+					// container exits as it is not PID1. TODO (irbekrm): perhaps we can replace the
+					// reaper by a running cmd.Wait in a goroutine immediately after starting
+					// tailscaled?
 					reaper := func() {
 						defer wg.Done()
 						for {
@@ -637,6 +636,8 @@ runLoop:
 			}
 			backendAddrs = newBackendAddrs
 			resetTimer(false)
+		case e := <-egressSvcsErrorChan:
+			log.Fatalf("egress proxy failed: %v", e)
 		}
 	}
 	wg.Wait()
@@ -741,5 +742,5 @@ func tailscaledConfigFilePath() string {
 		log.Fatalf("no tailscaled config file found in %q for current capability version %q", dir, tailcfg.CurrentCapabilityVersion)
 	}
 	log.Printf("Using tailscaled config file %q for capability version %q", maxCompatVer, tailcfg.CurrentCapabilityVersion)
-	return path.Join(dir, kubeutils.TailscaledConfigFileNameForCap(maxCompatVer))
+	return path.Join(dir, kubeutils.TailscaledConfigFileName(maxCompatVer))
 }

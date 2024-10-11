@@ -53,6 +53,8 @@ type configOpts struct {
 	shouldEnableForwardingClusterTrafficViaIngress bool
 	proxyClass                                     string // configuration from the named ProxyClass should be applied to proxy resources
 	app                                            string
+	shouldRemoveAuthKey                            bool
+	secretExtraData                                map[string][]byte
 }
 
 func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.StatefulSet {
@@ -365,6 +367,9 @@ func expectedSecret(t *testing.T, cl client.Client, opts configOpts) *corev1.Sec
 			conf.AcceptRoutes = "true"
 		}
 	}
+	if opts.shouldRemoveAuthKey {
+		conf.AuthKey = nil
+	}
 	var routes []netip.Prefix
 	if opts.subnetRoutes != "" || opts.isExitNode {
 		r := opts.subnetRoutes
@@ -405,6 +410,9 @@ func expectedSecret(t *testing.T, cl client.Client, opts configOpts) *corev1.Sec
 		labels["tailscale.com/parent-resource-ns"] = "" // Connector is cluster scoped
 	}
 	s.Labels = labels
+	for key, val := range opts.secretExtraData {
+		mak.Set(&s.Data, key, val)
+	}
 	return s
 }
 
@@ -596,7 +604,7 @@ func (c *fakeTSClient) CreateKey(ctx context.Context, caps tailscale.KeyCapabili
 func (c *fakeTSClient) Device(ctx context.Context, deviceID string, fields *tailscale.DeviceFieldsOpts) (*tailscale.Device, error) {
 	return &tailscale.Device{
 		DeviceID: deviceID,
-		Hostname: "test-device",
+		Hostname: "hostname-" + deviceID,
 		Addresses: []string{
 			"1.2.3.4",
 			"::1",
@@ -629,6 +637,14 @@ func (c *fakeTSClient) Deleted() []string {
 // change to the configfile contents).
 func removeHashAnnotation(sts *appsv1.StatefulSet) {
 	delete(sts.Spec.Template.Annotations, podAnnotationLastSetConfigFileHash)
+}
+
+func removeTargetPortsFromSvc(svc *corev1.Service) {
+	newPorts := make([]corev1.ServicePort, 0)
+	for _, p := range svc.Spec.Ports {
+		newPorts = append(newPorts, corev1.ServicePort{Protocol: p.Protocol, Port: p.Port})
+	}
+	svc.Spec.Ports = newPorts
 }
 
 func removeAuthKeyIfExistsModifier(t *testing.T) func(s *corev1.Secret) {

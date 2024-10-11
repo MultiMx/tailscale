@@ -199,7 +199,7 @@ func (r *RecorderReconciler) maybeProvision(ctx context.Context, tsr *tsapi.Reco
 		return fmt.Errorf("error creating StatefulSet: %w", err)
 	}
 
-	var devices []tsapi.TailnetDevice
+	var devices []tsapi.RecorderTailnetDevice
 
 	device, ok, err := r.getDeviceInfo(ctx, tsr.Name)
 	if err != nil {
@@ -302,9 +302,7 @@ func (r *RecorderReconciler) validate(tsr *tsapi.Recorder) error {
 	return nil
 }
 
-// getNodeMetadata returns 'ok == true' iff the node ID is found. The dnsName
-// is expected to always be non-empty if the node ID is, but not required.
-func (r *RecorderReconciler) getNodeMetadata(ctx context.Context, tsrName string) (id tailcfg.StableNodeID, dnsName string, ok bool, err error) {
+func (r *RecorderReconciler) getStateSecret(ctx context.Context, tsrName string) (*corev1.Secret, error) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: r.tsNamespace,
@@ -313,12 +311,27 @@ func (r *RecorderReconciler) getNodeMetadata(ctx context.Context, tsrName string
 	}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(secret), secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", "", false, nil
+			return nil, nil
 		}
 
+		return nil, fmt.Errorf("error getting state Secret: %w", err)
+	}
+
+	return secret, nil
+}
+
+func (r *RecorderReconciler) getNodeMetadata(ctx context.Context, tsrName string) (id tailcfg.StableNodeID, dnsName string, ok bool, err error) {
+	secret, err := r.getStateSecret(ctx, tsrName)
+	if err != nil || secret == nil {
 		return "", "", false, err
 	}
 
+	return getNodeMetadata(ctx, secret)
+}
+
+// getNodeMetadata returns 'ok == true' iff the node ID is found. The dnsName
+// is expected to always be non-empty if the node ID is, but not required.
+func getNodeMetadata(ctx context.Context, secret *corev1.Secret) (id tailcfg.StableNodeID, dnsName string, ok bool, err error) {
 	// TODO(tomhjp): Should maybe use ipn to parse the following info instead.
 	currentProfile, ok := secret.Data[currentProfileKey]
 	if !ok {
@@ -337,20 +350,29 @@ func (r *RecorderReconciler) getNodeMetadata(ctx context.Context, tsrName string
 	return tailcfg.StableNodeID(profile.Config.NodeID), profile.Config.UserProfile.LoginName, ok, nil
 }
 
-func (r *RecorderReconciler) getDeviceInfo(ctx context.Context, tsrName string) (d tsapi.TailnetDevice, ok bool, err error) {
-	nodeID, dnsName, ok, err := r.getNodeMetadata(ctx, tsrName)
+func (r *RecorderReconciler) getDeviceInfo(ctx context.Context, tsrName string) (d tsapi.RecorderTailnetDevice, ok bool, err error) {
+	secret, err := r.getStateSecret(ctx, tsrName)
+	if err != nil || secret == nil {
+		return tsapi.RecorderTailnetDevice{}, false, err
+	}
+
+	return getDeviceInfo(ctx, r.tsClient, secret)
+}
+
+func getDeviceInfo(ctx context.Context, tsClient tsClient, secret *corev1.Secret) (d tsapi.RecorderTailnetDevice, ok bool, err error) {
+	nodeID, dnsName, ok, err := getNodeMetadata(ctx, secret)
 	if !ok || err != nil {
-		return tsapi.TailnetDevice{}, false, err
+		return tsapi.RecorderTailnetDevice{}, false, err
 	}
 
 	// TODO(tomhjp): The profile info doesn't include addresses, which is why we
 	// need the API. Should we instead update the profile to include addresses?
-	device, err := r.tsClient.Device(ctx, string(nodeID), nil)
+	device, err := tsClient.Device(ctx, string(nodeID), nil)
 	if err != nil {
-		return tsapi.TailnetDevice{}, false, fmt.Errorf("failed to get device info from API: %w", err)
+		return tsapi.RecorderTailnetDevice{}, false, fmt.Errorf("failed to get device info from API: %w", err)
 	}
 
-	d = tsapi.TailnetDevice{
+	d = tsapi.RecorderTailnetDevice{
 		Hostname:   device.Hostname,
 		TailnetIPs: device.Addresses,
 	}
@@ -370,6 +392,6 @@ type profile struct {
 	} `json:"Config"`
 }
 
-func markedForDeletion(tsr *tsapi.Recorder) bool {
-	return !tsr.DeletionTimestamp.IsZero()
+func markedForDeletion(obj metav1.Object) bool {
+	return !obj.GetDeletionTimestamp().IsZero()
 }
