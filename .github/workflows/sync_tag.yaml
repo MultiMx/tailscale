@@ -14,14 +14,34 @@ jobs:
         with:
           token: ${{ secrets.PERSONAL_TOKEN }}
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Compare Binary MD5
+        id: compare
+        run: |
+          go build -trimpath -ldflags "-s -w -extldflags '-static -fpic'" ./cmd/derper
+          Current_Sum=$(md5sum derper | awk '{print substr($1, 1, 7)}')
+          Tailscale_Tag_Info=$(wget -qO- -t1 -T2 "https://api.github.com/repos/tailscale/tailscale/releases/latest" | grep "tag_name" | head -n 1)
+          Latest_Sum=$(echo "$Tailscale_Tag_Info" | awk -F "-" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+          if [ "$Current_Sum" = "$Latest_Sum" ]; then
+            Version="$(echo "$Tailscale_Tag_Info" | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')-$Current_Sum"
+            echo "New Version Detected: $Version"
+            echo "Version=$Version" >> $GITHUB_OUTPUT
+          else
+            echo "No Changes to Derper"
+          fi
+
       - name: Add tag
+        if: ${{ steps.compare.outputs.Version != null }}
         run: |
           git config --local user.email "green.dusk8264@fastmail.com"
           git config --local user.name "GitHub Action"
-          version=$(wget -qO- -t1 -T2 "https://api.github.com/repos/tailscale/tailscale/releases/latest" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')-$(git rev-parse --short ${{ github.sha }})
-          git tag -a $version -m "release $version"
+          git tag -a $version -m "release ${{ steps.compare.outputs.Version }}"
 
       - name: Push tags
+        if: ${{ steps.compare.outputs.Version != null }}
         uses: ad-m/github-push-action@master
         with:
           branch: main
