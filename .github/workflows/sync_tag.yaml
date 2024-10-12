@@ -23,10 +23,10 @@ jobs:
         run: |
           go build -trimpath -ldflags "-s -w -extldflags '-static -fpic'" ./cmd/derper
           Current_Sum=$(md5sum derper | awk '{print substr($1, 1, 7)}')
-          Tailscale_Tag_Info=$(wget -qO- -t1 -T2 "https://api.github.com/repos/tailscale/tailscale/releases/latest" | grep "tag_name" | head -n 1)
-          Latest_Sum=$(echo "$Tailscale_Tag_Info" | awk -F "-" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+          Latest_Sum=$(wget -qO- -t1 -T2 "https://api.github.com/repos/MultiMx/tailscale/releases/latest" | grep "tag_name" | head -n 1 | awk -F "-" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
           if [ "$Current_Sum" != "$Latest_Sum" ]; then
-            Version="$(echo "$Tailscale_Tag_Info" | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')-$Current_Sum"
+            Latest_Tag=$(wget -qO- -t1 -T2 "https://api.github.com/repos/tailscale/tailscale/releases/latest" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+            Version="$Latest_Tag-$Current_Sum"
             echo "New Version Detected: $Version"
             echo "Version=$Version" >> $GITHUB_OUTPUT
           else
