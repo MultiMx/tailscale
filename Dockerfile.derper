@@ -6,7 +6,7 @@ RUN apk update && \
     apk add --no-cache ca-certificates &&\
     rm -rf /var/cache/apk/*
 
-COPY /output/${TARGETPLATFORM}/derper /user/bin/derper
+COPY /build/output/${TARGETPLATFORM}/derper /user/bin/derper
 WORKDIR /data
 
 ENTRYPOINT [ "/usr/bin/derper" ]
