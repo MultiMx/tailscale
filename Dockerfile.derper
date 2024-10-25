@@ -1,18 +1,12 @@
-FROM alpine:latest AS selector
-ARG TARGETOS
-ARG TARGETARCH
-ARG TARGETVARIANT
-
-WORKDIR /output/
-COPY /build/output/derper_${TARGETOS}_${TARGETARCH}* .
-RUN if [ -z "$TARGETVARIANT" ]; then \
-        cp /output/derper_${TARGETOS}_${TARGETARCH} /output/derper; \
-    else \
-        cp /output/derper_${TARGETOS}_${TARGETARCH}_${TARGETVARIANT} /output/derper; \
-    fi
-RUN chmod +x /output/derper
-
 FROM alpine:latest
-COPY --from=selector /output/derper /user/bin/derper
+ARG TARGETPLATFORM
+
+RUN apk update && \
+    apk upgrade --no-cache && \
+    apk add --no-cache ca-certificates &&\
+    rm -rf /var/cache/apk/*
+
+COPY /output/${TARGETPLATFORM}/derper /user/bin/derper
 WORKDIR /data
+
 ENTRYPOINT [ "/usr/bin/derper" ]
