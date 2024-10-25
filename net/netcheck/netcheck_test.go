@@ -28,6 +28,9 @@ func newTestClient(t testing.TB) *Client {
 	c := &Client{
 		NetMon: netmon.NewStatic(),
 		Logf:   t.Logf,
+		TimeNow: func() time.Time {
+			return time.Unix(1729624521, 0)
+		},
 	}
 	return c
 }
@@ -38,7 +41,7 @@ func TestBasic(t *testing.T) {
 
 	c := newTestClient(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	if err := c.Standalone(ctx, "127.0.0.1:0"); err != nil {
@@ -51,6 +54,9 @@ func TestBasic(t *testing.T) {
 	}
 	if !r.UDP {
 		t.Error("want UDP")
+	}
+	if r.Now.IsZero() {
+		t.Error("Now is zero")
 	}
 	if len(r.RegionLatency) != 1 {
 		t.Errorf("expected 1 key in DERPLatency; got %+v", r.RegionLatency)
@@ -117,7 +123,7 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 
 	c := newTestClient(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	r, err := c.GetReport(ctx, dm, nil)
@@ -129,6 +135,14 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 	r.PCP = ""
 
 	want := newReport()
+
+	// The Now field can't be compared with reflect.DeepEqual; check using
+	// the Equal method and then overwrite it so that the comparison below
+	// succeeds.
+	if !r.Now.Equal(c.TimeNow()) {
+		t.Errorf("Now = %v; want %v", r.Now, c.TimeNow())
+	}
+	want.Now = r.Now
 
 	// The IPv4CanSend flag gets set differently across platforms.
 	// On Windows this test detects false, while on Linux detects true.
@@ -870,5 +884,32 @@ func TestReportTimeouts(t *testing.T) {
 	}
 	if ReportTimeout < httpsProbeTimeout {
 		t.Errorf("ReportTimeout (%v) cannot be less than httpsProbeTimeout (%v)", ReportTimeout, httpsProbeTimeout)
+	}
+}
+
+func TestNoUDPNilGetReportOpts(t *testing.T) {
+	blackhole, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to open blackhole STUN listener: %v", err)
+	}
+	defer blackhole.Close()
+
+	dm := stuntest.DERPMapOf(blackhole.LocalAddr().String())
+	for _, region := range dm.Regions {
+		for _, n := range region.Nodes {
+			n.STUNOnly = false // exercise ICMP & HTTPS probing
+		}
+	}
+
+	c := newTestClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r, err := c.GetReport(ctx, dm, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.UDP {
+		t.Fatal("unexpected working UDP")
 	}
 }
