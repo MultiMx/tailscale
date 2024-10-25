@@ -43,7 +43,7 @@ jobs:
           out-file-path: './build/'
 
       - name: Build Binary
-        run: ./build/release ./cmd/derper -c tar.gz -f post --extra-arches --output build/output
+        run: ./build/release ./cmd/derper -c tar.gz  --extra-arches --divider "/" --output-format post --output build/output
 
       - name: Upload Release
         uses: softprops/action-gh-release@v2
