@@ -50,6 +50,25 @@ jobs:
         with:
           files: build/output/*.tar.gz
 
+  release-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Setup Release Cli
+        uses: robinraju/release-downloader@v1.10
+        with:
+          repository: "Mmx233/GoReleaseCli"
+          latest: true
+          fileName: 'release_linux_amd64.tar.gz'
+          extract: true
+          out-file-path: './build/'
+
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
@@ -67,6 +86,11 @@ jobs:
         with:
           username: mmx233
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build Binary
+        run: |
+          ./build/release ./cmd/derper --platforms linux/amd64,linux/arm64,linux/386,linux/ppc64le,linux/riscv64,linux/s390x --divider "/" --output-format post --output build/output
+          ./build/release ./cmd/derper --platforms linux/arm --extra-arches  --divider "/" --output-format post --output build/output --disable-auto-clean
 
       - name: Build and push
         uses: docker/build-push-action@v5
