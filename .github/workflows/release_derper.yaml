@@ -43,7 +43,7 @@ jobs:
           out-file-path: './build/'
 
       - name: Build Binary
-        run: ./build/release ./cmd/derper -c tar.gz  --extra-arches --divider "/" --output-format post --output build/output
+        run: ./build/release ./cmd/derper -c tar.gz  --extra-arches --output build/output
 
       - name: Upload Release
         uses: softprops/action-gh-release@v2
@@ -86,7 +86,17 @@ jobs:
         with:
           username: mmx233
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+        with:
+          go-version: 'stable'
 
+      - name: Setup Release Cli
+        uses: robinraju/release-downloader@v1.10
+        with:
+          repository: "Mmx233/GoReleaseCli"
+          latest: true
+          fileName: 'release_linux_amd64.tar.gz'
+          extract: true
+          out-file-path: './build/'
       - name: Build Binary
         run: |
           ./build/release ./cmd/derper --platforms linux/amd64,linux/arm64,linux/386,linux/ppc64le,linux/riscv64,linux/s390x --divider "/" --output-format post --output build/output
