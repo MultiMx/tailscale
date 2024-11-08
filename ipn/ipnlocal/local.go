@@ -399,11 +399,6 @@ type metrics struct {
 	// approvedRoutes is a metric that reports the number of network routes served by the local node and approved
 	// by the control server.
 	approvedRoutes *usermetric.Gauge
-
-	// primaryRoutes is a metric that reports the number of primary network routes served by the local node.
-	// A route being a primary route implies that the route is currently served by this node, and not by another
-	// subnet router in a high availability configuration.
-	primaryRoutes *usermetric.Gauge
 }
 
 // clientGen is a func that creates a control plane client.
@@ -454,8 +449,6 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 			"tailscaled_advertised_routes", "Number of advertised network routes (e.g. by a subnet router)"),
 		approvedRoutes: sys.UserMetricsRegistry().NewGauge(
 			"tailscaled_approved_routes", "Number of approved network routes (e.g. by a subnet router)"),
-		primaryRoutes: sys.UserMetricsRegistry().NewGauge(
-			"tailscaled_primary_routes", "Number of network routes for which this node is a primary router (in high availability configuration)"),
 	}
 
 	b := &LocalBackend{
@@ -486,7 +479,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	mConn.SetNetInfoCallback(b.setNetInfo)
 
 	if sys.InitialConfig != nil {
-		if err := b.setConfigLocked(sys.InitialConfig); err != nil {
+		if err := b.initPrefsFromConfig(sys.InitialConfig); err != nil {
 			return nil, err
 		}
 	}
@@ -719,8 +712,8 @@ func (b *LocalBackend) SetDirectFileRoot(dir string) {
 // It returns (false, nil) if not running in declarative mode, (true, nil) on
 // success, or (false, error) on failure.
 func (b *LocalBackend) ReloadConfig() (ok bool, err error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
 	if b.conf == nil {
 		return false, nil
 	}
@@ -728,18 +721,21 @@ func (b *LocalBackend) ReloadConfig() (ok bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	if err := b.setConfigLocked(conf); err != nil {
+	if err := b.setConfigLockedOnEntry(conf, unlock); err != nil {
 		return false, fmt.Errorf("error setting config: %w", err)
 	}
 
 	return true, nil
 }
 
-func (b *LocalBackend) setConfigLocked(conf *conffile.Config) error {
-
-	// TODO(irbekrm): notify the relevant components to consume any prefs
-	// updates. Currently only initial configfile settings are applied
-	// immediately.
+// initPrefsFromConfig initializes the backend's prefs from the provided config.
+// This should only be called once, at startup. For updates at runtime, use
+// [LocalBackend.setConfigLocked].
+func (b *LocalBackend) initPrefsFromConfig(conf *conffile.Config) error {
+	// TODO(maisem,bradfitz): combine this with setConfigLocked. This is called
+	// before anything is running, so there's no need to lock and we don't
+	// update any subsystems. At runtime, we both need to lock and update
+	// subsystems with the new prefs.
 	p := b.pm.CurrentPrefs().AsStruct()
 	mp, err := conf.Parsed.ToPrefs()
 	if err != nil {
@@ -749,13 +745,14 @@ func (b *LocalBackend) setConfigLocked(conf *conffile.Config) error {
 	if err := b.pm.SetPrefs(p.View(), ipn.NetworkProfile{}); err != nil {
 		return err
 	}
+	b.setStaticEndpointsFromConfigLocked(conf)
+	b.conf = conf
+	return nil
+}
 
-	defer func() {
-		b.conf = conf
-	}()
-
+func (b *LocalBackend) setStaticEndpointsFromConfigLocked(conf *conffile.Config) {
 	if conf.Parsed.StaticEndpoints == nil && (b.conf == nil || b.conf.Parsed.StaticEndpoints == nil) {
-		return nil
+		return
 	}
 
 	// Ensure that magicsock conn has the up to date static wireguard
@@ -769,6 +766,22 @@ func (b *LocalBackend) setConfigLocked(conf *conffile.Config) error {
 			ms.SetStaticEndpoints(views.SliceOf(conf.Parsed.StaticEndpoints))
 		}
 	}
+}
+
+// setConfigLockedOnEntry uses the provided config to update the backend's prefs
+// and other state.
+func (b *LocalBackend) setConfigLockedOnEntry(conf *conffile.Config, unlock unlockOnce) error {
+	defer unlock()
+	p := b.pm.CurrentPrefs().AsStruct()
+	mp, err := conf.Parsed.ToPrefs()
+	if err != nil {
+		return fmt.Errorf("error parsing config to prefs: %w", err)
+	}
+	p.ApplyEdits(&mp)
+	b.setStaticEndpointsFromConfigLocked(conf)
+	b.setPrefsLockedOnEntry(p, unlock)
+
+	b.conf = conf
 	return nil
 }
 
@@ -785,6 +798,19 @@ func (b *LocalBackend) pauseOrResumeControlClientLocked() {
 	}
 	networkUp := b.prevIfState.AnyInterfaceUp()
 	b.cc.SetPaused((b.state == ipn.Stopped && b.netMap != nil) || (!networkUp && !testenv.InTest() && !assumeNetworkUpdateForTest()))
+}
+
+// DisconnectControl shuts down control client. This can be run before node shutdown to force control to consider this ndoe
+// inactive. This can be used to ensure that nodes that are HA subnet router or app connector replicas are shutting
+// down, clients switch over to other replicas whilst the existing connections are kept alive for some period of time.
+func (b *LocalBackend) DisconnectControl() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	cc := b.resetControlClientLocked()
+	if cc == nil {
+		return
+	}
+	cc.Shutdown()
 }
 
 // captivePortalDetectionInterval is the duration to wait in an unhealthy state with connectivity broken
@@ -5477,7 +5503,6 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 		// If there is no netmap, the client is going into a "turned off"
 		// state so reset the metrics.
 		b.metrics.approvedRoutes.Set(0)
-		b.metrics.primaryRoutes.Set(0)
 		return
 	}
 
@@ -5506,7 +5531,6 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 			}
 		}
 		b.metrics.approvedRoutes.Set(approved)
-		b.metrics.primaryRoutes.Set(float64(tsaddr.WithoutExitRoute(nm.SelfNode.PrimaryRoutes()).Len()))
 	}
 	for _, p := range nm.Peers {
 		addNode(p)

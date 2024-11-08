@@ -983,7 +983,8 @@ func (de *endpoint) send(buffs [][]byte) error {
 		allOk := true
 		var txBytes int
 		for _, buff := range buffs {
-			ok, _ := de.c.sendAddr(derpAddr, de.publicKey, buff)
+			const isDisco = false
+			ok, _ := de.c.sendAddr(derpAddr, de.publicKey, buff, isDisco)
 			txBytes += len(buff)
 			if !ok {
 				allOk = false
@@ -991,7 +992,7 @@ func (de *endpoint) send(buffs [][]byte) error {
 		}
 
 		if stats := de.c.stats.Load(); stats != nil {
-			stats.UpdateTxPhysical(de.nodeAddr, derpAddr, 1, txBytes)
+			stats.UpdateTxPhysical(de.nodeAddr, derpAddr, len(buffs), txBytes)
 		}
 		if allOk {
 			return nil
