@@ -353,13 +353,14 @@ func expectedSecret(t *testing.T, cl client.Client, opts configOpts) *corev1.Sec
 		mak.Set(&s.StringData, "serve-config", string(serveConfigBs))
 	}
 	conf := &ipn.ConfigVAlpha{
-		Version:      "alpha0",
-		AcceptDNS:    "false",
-		Hostname:     &opts.hostname,
-		Locked:       "false",
-		AuthKey:      ptr.To("secret-authkey"),
-		AcceptRoutes: "false",
-		AppConnector: &ipn.AppConnectorPrefs{Advertise: false},
+		Version:             "alpha0",
+		AcceptDNS:           "false",
+		Hostname:            &opts.hostname,
+		Locked:              "false",
+		AuthKey:             ptr.To("secret-authkey"),
+		AcceptRoutes:        "false",
+		AppConnector:        &ipn.AppConnectorPrefs{Advertise: false},
+		NoStatefulFiltering: "true",
 	}
 	if opts.proxyClass != "" {
 		t.Logf("applying configuration from ProxyClass %s", opts.proxyClass)
@@ -390,11 +391,6 @@ func expectedSecret(t *testing.T, cl client.Client, opts configOpts) *corev1.Sec
 			}
 			routes = append(routes, prefix)
 		}
-	}
-	if opts.tailnetTargetFQDN != "" || opts.tailnetTargetIP != "" {
-		conf.NoStatefulFiltering = "true"
-	} else {
-		conf.NoStatefulFiltering = "false"
 	}
 	conf.AdvertiseRoutes = routes
 	bnn, err := json.Marshal(conf)
@@ -650,7 +646,7 @@ func removeHashAnnotation(sts *appsv1.StatefulSet) {
 func removeTargetPortsFromSvc(svc *corev1.Service) {
 	newPorts := make([]corev1.ServicePort, 0)
 	for _, p := range svc.Spec.Ports {
-		newPorts = append(newPorts, corev1.ServicePort{Protocol: p.Protocol, Port: p.Port})
+		newPorts = append(newPorts, corev1.ServicePort{Protocol: p.Protocol, Port: p.Port, Name: p.Name})
 	}
 	svc.Spec.Ports = newPorts
 }
