@@ -199,6 +199,9 @@ func (s *settings) validate() error {
 	if s.HealthCheckEnabled && s.HealthCheckAddrPort != "" {
 		return errors.New("TS_HEALTHCHECK_ADDR_PORT is deprecated and will be removed in 1.82.0, use TS_ENABLE_HEALTH_CHECK and optionally TS_LOCAL_ADDR_PORT")
 	}
+	if s.EgressSvcsCfgPath != "" && !(s.InKubernetes && s.KubeSecret != "") {
+		return errors.New("TS_EGRESS_SERVICES_CONFIG_PATH is only supported for Tailscale running on Kubernetes")
+	}
 	return nil
 }
 
@@ -214,6 +217,7 @@ func (cfg *settings) setupKube(ctx context.Context, kc *kubeClient) error {
 		return fmt.Errorf("some Kubernetes permissions are missing, please check your RBAC configuration: %v", err)
 	}
 	cfg.KubernetesCanPatch = canPatch
+	kc.canPatch = canPatch
 
 	s, err := kc.GetSecret(ctx, cfg.KubeSecret)
 	if err != nil {
