@@ -30,7 +30,6 @@ import (
 	"tailscale.com/control/controlclient"
 	"tailscale.com/drive"
 	"tailscale.com/drive/driveimpl"
-	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -1008,8 +1007,8 @@ func TestUpdateNetmapDelta(t *testing.T) {
 
 	wants := []*tailcfg.Node{
 		{
-			ID:   1,
-			DERP: "127.3.3.40:1",
+			ID:       1,
+			HomeDERP: 1,
 		},
 		{
 			ID:     2,
@@ -1867,16 +1866,16 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 		PreferredDERP: 2,
 	}
 	tests := []struct {
-		name                      string
-		lastSuggestedExitNode     tailcfg.StableNodeID
-		netmap                    *netmap.NetworkMap
-		muts                      []*tailcfg.PeerChange
-		exitNodeIDWant            tailcfg.StableNodeID
-		updateNetmapDeltaResponse bool
-		report                    *netcheck.Report
+		name                  string
+		lastSuggestedExitNode tailcfg.StableNodeID
+		netmap                *netmap.NetworkMap
+		muts                  []*tailcfg.PeerChange
+		exitNodeIDWant        tailcfg.StableNodeID
+		report                *netcheck.Report
 	}{
 		{
-			name:                  "selected auto exit node goes offline",
+			// selected auto exit node goes offline
+			name:                  "exit-node-goes-offline",
 			lastSuggestedExitNode: peer1.StableID(),
 			netmap: &netmap.NetworkMap{
 				Peers: []tailcfg.NodeView{
@@ -1895,12 +1894,12 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 					Online: ptr.To(true),
 				},
 			},
-			exitNodeIDWant:            peer2.StableID(),
-			updateNetmapDeltaResponse: false,
-			report:                    report,
+			exitNodeIDWant: peer2.StableID(),
+			report:         report,
 		},
 		{
-			name:                  "other exit node goes offline doesn't change selected auto exit node that's still online",
+			// other exit node goes offline doesn't change selected auto exit node that's still online
+			name:                  "other-node-goes-offline",
 			lastSuggestedExitNode: peer2.StableID(),
 			netmap: &netmap.NetworkMap{
 				Peers: []tailcfg.NodeView{
@@ -1919,9 +1918,8 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 					Online: ptr.To(true),
 				},
 			},
-			exitNodeIDWant:            peer2.StableID(),
-			updateNetmapDeltaResponse: true,
-			report:                    report,
+			exitNodeIDWant: peer2.StableID(),
+			report:         report,
 		},
 	}
 
@@ -1939,6 +1937,20 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 			b.lastSuggestedExitNode = tt.lastSuggestedExitNode
 			b.sys.MagicSock.Get().SetLastNetcheckReportForTest(b.ctx, tt.report)
 			b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
+
+			allDone := make(chan bool, 1)
+			defer b.goTracker.AddDoneCallback(func() {
+				b.mu.Lock()
+				defer b.mu.Unlock()
+				if b.goTracker.RunningGoroutines() > 0 {
+					return
+				}
+				select {
+				case allDone <- true:
+				default:
+				}
+			})()
+
 			someTime := time.Unix(123, 0)
 			muts, ok := netmap.MutationsFromMapResponse(&tailcfg.MapResponse{
 				PeersChangedPatch: tt.muts,
@@ -1946,16 +1958,34 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 			if !ok {
 				t.Fatal("netmap.MutationsFromMapResponse failed")
 			}
+
 			if b.pm.prefs.ExitNodeID() != tt.lastSuggestedExitNode {
 				t.Fatalf("did not set exit node ID to last suggested exit node despite auto policy")
 			}
 
+			was := b.goTracker.StartedGoroutines()
 			got := b.UpdateNetmapDelta(muts)
-			if got != tt.updateNetmapDeltaResponse {
-				t.Fatalf("got %v expected %v from UpdateNetmapDelta", got, tt.updateNetmapDeltaResponse)
+			if !got {
+				t.Error("got false from UpdateNetmapDelta")
 			}
-			if b.pm.prefs.ExitNodeID() != tt.exitNodeIDWant {
-				t.Fatalf("did not get expected exit node id after UpdateNetmapDelta")
+			startedGoroutine := b.goTracker.StartedGoroutines() != was
+
+			wantChange := tt.exitNodeIDWant != tt.lastSuggestedExitNode
+			if startedGoroutine != wantChange {
+				t.Errorf("got startedGoroutine %v, want %v", startedGoroutine, wantChange)
+			}
+			if startedGoroutine {
+				select {
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for goroutine to finish")
+				case <-allDone:
+				}
+			}
+			b.mu.Lock()
+			gotExitNode := b.pm.prefs.ExitNodeID()
+			b.mu.Unlock()
+			if gotExitNode != tt.exitNodeIDWant {
+				t.Fatalf("exit node ID after UpdateNetmapDelta = %v; want %v", gotExitNode, tt.exitNodeIDWant)
 			}
 		})
 	}
@@ -1991,7 +2021,7 @@ func TestAutoExitNodeSetNetInfoCallback(t *testing.T) {
 			netip.MustParsePrefix("100.64.1.1/32"),
 			netip.MustParsePrefix("fe70::1/128"),
 		},
-		DERP: "127.3.3.40:2",
+		HomeDERP: 2,
 	}
 	defaultDERPMap := &tailcfg.DERPMap{
 		Regions: map[int]*tailcfg.DERPRegion{
@@ -2955,7 +2985,7 @@ func makePeer(id tailcfg.NodeID, opts ...peerOptFunc) tailcfg.NodeView {
 		ID:       id,
 		StableID: tailcfg.StableNodeID(fmt.Sprintf("stable%d", id)),
 		Name:     fmt.Sprintf("peer%d", id),
-		DERP:     fmt.Sprintf("127.3.3.40:%d", id),
+		HomeDERP: int(id),
 	}
 	for _, opt := range opts {
 		opt(node)
@@ -2971,13 +3001,13 @@ func withName(name string) peerOptFunc {
 
 func withDERP(region int) peerOptFunc {
 	return func(n *tailcfg.Node) {
-		n.DERP = fmt.Sprintf("127.3.3.40:%d", region)
+		n.HomeDERP = region
 	}
 }
 
 func withoutDERP() peerOptFunc {
 	return func(n *tailcfg.Node) {
-		n.DERP = ""
+		n.HomeDERP = 0
 	}
 }
 
@@ -4478,15 +4508,15 @@ func TestConfigFileReload(t *testing.T) {
 
 func TestGetVIPServices(t *testing.T) {
 	tests := []struct {
-		name       string
-		advertised []string
-		mapped     []string
-		want       []*tailcfg.VIPService
+		name        string
+		advertised  []string
+		serveConfig *ipn.ServeConfig
+		want        []*tailcfg.VIPService
 	}{
 		{
 			"advertised-only",
 			[]string{"svc:abc", "svc:def"},
-			[]string{},
+			&ipn.ServeConfig{},
 			[]*tailcfg.VIPService{
 				{
 					Name:   "svc:abc",
@@ -4499,9 +4529,13 @@ func TestGetVIPServices(t *testing.T) {
 			},
 		},
 		{
-			"mapped-only",
+			"served-only",
 			[]string{},
-			[]string{"svc:abc"},
+			&ipn.ServeConfig{
+				Services: map[string]*ipn.ServiceConfig{
+					"svc:abc": {Tun: true},
+				},
+			},
 			[]*tailcfg.VIPService{
 				{
 					Name:  "svc:abc",
@@ -4510,9 +4544,13 @@ func TestGetVIPServices(t *testing.T) {
 			},
 		},
 		{
-			"mapped-and-advertised",
+			"served-and-advertised",
 			[]string{"svc:abc"},
-			[]string{"svc:abc"},
+			&ipn.ServeConfig{
+				Services: map[string]*ipn.ServiceConfig{
+					"svc:abc": {Tun: true},
+				},
+			},
 			[]*tailcfg.VIPService{
 				{
 					Name:   "svc:abc",
@@ -4522,9 +4560,13 @@ func TestGetVIPServices(t *testing.T) {
 			},
 		},
 		{
-			"mapped-and-advertised-separately",
+			"served-and-advertised-different-service",
 			[]string{"svc:def"},
-			[]string{"svc:abc"},
+			&ipn.ServeConfig{
+				Services: map[string]*ipn.ServiceConfig{
+					"svc:abc": {Tun: true},
+				},
+			},
 			[]*tailcfg.VIPService{
 				{
 					Name:  "svc:abc",
@@ -4536,14 +4578,78 @@ func TestGetVIPServices(t *testing.T) {
 				},
 			},
 		},
+		{
+			"served-with-port-ranges-one-range-single",
+			[]string{},
+			&ipn.ServeConfig{
+				Services: map[string]*ipn.ServiceConfig{
+					"svc:abc": {TCP: map[uint16]*ipn.TCPPortHandler{
+						80: {HTTPS: true},
+					}},
+				},
+			},
+			[]*tailcfg.VIPService{
+				{
+					Name:  "svc:abc",
+					Ports: []tailcfg.ProtoPortRange{{Proto: 6, Ports: tailcfg.PortRange{First: 80, Last: 80}}},
+				},
+			},
+		},
+		{
+			"served-with-port-ranges-one-range-multiple",
+			[]string{},
+			&ipn.ServeConfig{
+				Services: map[string]*ipn.ServiceConfig{
+					"svc:abc": {TCP: map[uint16]*ipn.TCPPortHandler{
+						80: {HTTPS: true},
+						81: {HTTPS: true},
+						82: {HTTPS: true},
+					}},
+				},
+			},
+			[]*tailcfg.VIPService{
+				{
+					Name:  "svc:abc",
+					Ports: []tailcfg.ProtoPortRange{{Proto: 6, Ports: tailcfg.PortRange{First: 80, Last: 82}}},
+				},
+			},
+		},
+		{
+			"served-with-port-ranges-multiple-ranges",
+			[]string{},
+			&ipn.ServeConfig{
+				Services: map[string]*ipn.ServiceConfig{
+					"svc:abc": {TCP: map[uint16]*ipn.TCPPortHandler{
+						80:   {HTTPS: true},
+						81:   {HTTPS: true},
+						82:   {HTTPS: true},
+						1212: {HTTPS: true},
+						1213: {HTTPS: true},
+						1214: {HTTPS: true},
+					}},
+				},
+			},
+			[]*tailcfg.VIPService{
+				{
+					Name: "svc:abc",
+					Ports: []tailcfg.ProtoPortRange{
+						{Proto: 6, Ports: tailcfg.PortRange{First: 80, Last: 82}},
+						{Proto: 6, Ports: tailcfg.PortRange{First: 1212, Last: 1214}},
+					},
+				},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			envknob.Setenv("TS_DEBUG_ALLPORTS_SERVICES", strings.Join(tt.mapped, ","))
+			lb := newLocalBackendWithTestControl(t, false, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+				return newClient(tb, opts)
+			})
+			lb.serveConfig = tt.serveConfig.View()
 			prefs := &ipn.Prefs{
 				AdvertiseServices: tt.advertised,
 			}
-			got := vipServicesFromPrefs(prefs.View())
+			got := lb.vipServicesFromPrefsLocked(prefs.View())
 			slices.SortFunc(got, func(a, b *tailcfg.VIPService) int {
 				return strings.Compare(a.Name, b.Name)
 			})
@@ -4682,6 +4788,157 @@ func TestUpdatePrefsOnSysPolicyChange(t *testing.T) {
 			store.SetStrings(tt.stringSettings...)
 
 			nw.check()
+		})
+	}
+}
+
+func TestUpdateIngressLocked(t *testing.T) {
+	tests := []struct {
+		name              string
+		hi                *tailcfg.Hostinfo
+		sc                *ipn.ServeConfig
+		wantIngress       bool
+		wantWireIngress   bool
+		wantControlUpdate bool
+	}{
+		{
+			name: "no_hostinfo_no_serve_config",
+			hi:   nil,
+		},
+		{
+			name: "empty_hostinfo_no_serve_config",
+			hi:   &tailcfg.Hostinfo{},
+		},
+		{
+			name: "empty_hostinfo_funnel_enabled",
+			hi:   &tailcfg.Hostinfo{},
+			sc: &ipn.ServeConfig{
+				AllowFunnel: map[ipn.HostPort]bool{
+					"tailnet.xyz:443": true,
+				},
+			},
+			wantIngress:       true,
+			wantWireIngress:   true,
+			wantControlUpdate: true,
+		},
+		{
+			name: "empty_hostinfo_funnel_disabled",
+			hi:   &tailcfg.Hostinfo{},
+			sc: &ipn.ServeConfig{
+				AllowFunnel: map[ipn.HostPort]bool{
+					"tailnet.xyz:443": false,
+				},
+			},
+			wantWireIngress:   true, // true if there is any AllowFunnel block
+			wantControlUpdate: true,
+		},
+		{
+			name: "empty_hostinfo_no_funnel",
+			hi:   &tailcfg.Hostinfo{},
+			sc: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {HTTPS: true},
+				},
+			},
+		},
+		{
+			name: "funnel_enabled_no_change",
+			hi: &tailcfg.Hostinfo{
+				IngressEnabled: true,
+				WireIngress:    true,
+			},
+			sc: &ipn.ServeConfig{
+				AllowFunnel: map[ipn.HostPort]bool{
+					"tailnet.xyz:443": true,
+				},
+			},
+			wantIngress:     true,
+			wantWireIngress: true,
+		},
+		{
+			name: "funnel_disabled_no_change",
+			hi: &tailcfg.Hostinfo{
+				WireIngress: true,
+			},
+			sc: &ipn.ServeConfig{
+				AllowFunnel: map[ipn.HostPort]bool{
+					"tailnet.xyz:443": false,
+				},
+			},
+			wantWireIngress: true, // true if there is any AllowFunnel block
+		},
+		{
+			name: "funnel_changes_to_disabled",
+			hi: &tailcfg.Hostinfo{
+				IngressEnabled: true,
+				WireIngress:    true,
+			},
+			sc: &ipn.ServeConfig{
+				AllowFunnel: map[ipn.HostPort]bool{
+					"tailnet.xyz:443": false,
+				},
+			},
+			wantWireIngress:   true, // true if there is any AllowFunnel block
+			wantControlUpdate: true,
+		},
+		{
+			name: "funnel_changes_to_enabled",
+			hi: &tailcfg.Hostinfo{
+				WireIngress: true,
+			},
+			sc: &ipn.ServeConfig{
+				AllowFunnel: map[ipn.HostPort]bool{
+					"tailnet.xyz:443": true,
+				},
+			},
+			wantWireIngress:   true,
+			wantIngress:       true,
+			wantControlUpdate: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := newTestLocalBackend(t)
+			b.hostinfo = tt.hi
+			b.serveConfig = tt.sc.View()
+			allDone := make(chan bool, 1)
+			defer b.goTracker.AddDoneCallback(func() {
+				b.mu.Lock()
+				defer b.mu.Unlock()
+				if b.goTracker.RunningGoroutines() > 0 {
+					return
+				}
+				select {
+				case allDone <- true:
+				default:
+				}
+			})()
+
+			was := b.goTracker.StartedGoroutines()
+			b.updateIngressLocked()
+
+			if tt.hi != nil {
+				if tt.hi.IngressEnabled != tt.wantIngress {
+					t.Errorf("IngressEnabled = %v, want %v", tt.hi.IngressEnabled, tt.wantIngress)
+				}
+				if tt.hi.WireIngress != tt.wantWireIngress {
+					t.Errorf("WireIngress = %v, want %v", tt.hi.WireIngress, tt.wantWireIngress)
+				}
+			}
+
+			startedGoroutine := b.goTracker.StartedGoroutines() != was
+			if startedGoroutine != tt.wantControlUpdate {
+				t.Errorf("control update triggered = %v, want %v", startedGoroutine, tt.wantControlUpdate)
+			}
+
+			if startedGoroutine {
+				select {
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for goroutine to finish")
+				case <-allDone:
+				}
+			}
 		})
 	}
 }
