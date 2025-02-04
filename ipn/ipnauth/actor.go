@@ -27,6 +27,11 @@ type Actor interface {
 	// a connected LocalAPI client. Otherwise, it returns a zero value and false.
 	ClientID() (_ ClientID, ok bool)
 
+	// CheckProfileAccess checks whether the actor has the necessary access rights
+	// to perform a given action on the specified Tailscale profile.
+	// It returns an error if access is denied.
+	CheckProfileAccess(profile ipn.LoginProfileView, requestedAccess ProfileAccess) error
+
 	// IsLocalSystem reports whether the actor is the Windows' Local System account.
 	//
 	// Deprecated: this method exists for compatibility with the current (as of 2024-08-27)

@@ -137,12 +137,12 @@ func TestIngressPGReconciler(t *testing.T) {
 		t.Fatalf("unmarshaling serve config: %v", err)
 	}
 
-	if cfg.Services["my-svc"] == nil {
+	if cfg.Services["svc:my-svc"] == nil {
 		t.Error("expected serve config to contain VIPService configuration")
 	}
 
 	// Verify VIPService uses default tags
-	vipSvc, err := ft.getVIPServiceByName(context.Background(), "my-svc")
+	vipSvc, err := ft.getVIPService(context.Background(), "svc:my-svc")
 	if err != nil {
 		t.Fatalf("getting VIPService: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestIngressPGReconciler(t *testing.T) {
 	expectReconciled(t, ingPGR, "default", "test-ingress")
 
 	// Verify VIPService uses custom tags
-	vipSvc, err = ft.getVIPServiceByName(context.Background(), "my-svc")
+	vipSvc, err = ft.getVIPService(context.Background(), "svc:my-svc")
 	if err != nil {
 		t.Fatalf("getting VIPService: %v", err)
 	}

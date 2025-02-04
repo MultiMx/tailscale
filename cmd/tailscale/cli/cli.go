@@ -25,6 +25,7 @@ import (
 	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/envknob"
 	"tailscale.com/paths"
+	"tailscale.com/util/slicesx"
 	"tailscale.com/version/distro"
 )
 
@@ -182,14 +183,14 @@ For help on subcommands, add --help after: "tailscale status --help".
 This CLI is still under active development. Commands and flags will
 change in the future.
 `),
-		Subcommands: append([]*ffcli.Command{
+		Subcommands: nonNilCmds(
 			upCmd,
 			downCmd,
 			setCmd,
 			loginCmd,
 			logoutCmd,
 			switchCmd,
-			configureCmd,
+			configureCmd(),
 			syspolicyCmd,
 			netcheckCmd,
 			ipCmd,
@@ -211,10 +212,12 @@ change in the future.
 			exitNodeCmd(),
 			updateCmd,
 			whoisCmd,
-			debugCmd,
+			debugCmd(),
 			driveCmd,
 			idTokenCmd,
-		}, maybeAdvertiseCmd()...),
+			advertiseCmd(),
+			configureHostCmd(),
+		),
 		FlagSet: rootfs,
 		Exec: func(ctx context.Context, args []string) error {
 			if len(args) > 0 {
@@ -222,10 +225,6 @@ change in the future.
 			}
 			return flag.ErrHelp
 		},
-	}
-
-	if runtime.GOOS == "linux" && distro.Get() == distro.Synology {
-		rootCmd.Subcommands = append(rootCmd.Subcommands, configureHostCmd)
 	}
 
 	walkCommands(rootCmd, func(w cmdWalk) bool {
@@ -237,6 +236,10 @@ change in the future.
 
 	ffcomplete.Inject(rootCmd, func(c *ffcli.Command) { c.LongHelp = hidden + c.LongHelp }, usageFunc)
 	return rootCmd
+}
+
+func nonNilCmds(cmds ...*ffcli.Command) []*ffcli.Command {
+	return slicesx.AppendNonzero(cmds[:0], cmds)
 }
 
 func fatalf(format string, a ...any) {
