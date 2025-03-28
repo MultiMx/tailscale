@@ -331,34 +331,6 @@ func runReconcilers(opts reconcilerOpts) {
 	if err != nil {
 		startlog.Fatalf("could not create ingress reconciler: %v", err)
 	}
-	lc, err := opts.tsServer.LocalClient()
-	if err != nil {
-		startlog.Fatalf("could not get local client: %v", err)
-	}
-	ingressProxyGroupFilter := handler.EnqueueRequestsFromMapFunc(ingressesFromIngressProxyGroup(mgr.GetClient(), opts.log))
-	err = builder.
-		ControllerManagedBy(mgr).
-		For(&networkingv1.Ingress{}).
-		Named("ingress-pg-reconciler").
-		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(serviceHandlerForIngressPG(mgr.GetClient(), startlog))).
-		Watches(&tsapi.ProxyGroup{}, ingressProxyGroupFilter).
-		Complete(&IngressPGReconciler{
-			recorder:    eventRecorder,
-			tsClient:    opts.tsClient,
-			tsnetServer: opts.tsServer,
-			defaultTags: strings.Split(opts.proxyTags, ","),
-			Client:      mgr.GetClient(),
-			logger:      opts.log.Named("ingress-pg-reconciler"),
-			lc:          lc,
-			tsNamespace: opts.tailscaleNamespace,
-		})
-	if err != nil {
-		startlog.Fatalf("could not create ingress-pg-reconciler: %v", err)
-	}
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), new(networkingv1.Ingress), indexIngressProxyGroup, indexPGIngresses); err != nil {
-		startlog.Fatalf("failed setting up indexer for HA Ingresses: %v", err)
-	}
-
 	connectorFilter := handler.EnqueueRequestsFromMapFunc(managedResourceHandlerForType("connector"))
 	// If a ProxyClassChanges, enqueue all Connectors that have
 	// .spec.proxyClass set to the name of this ProxyClass.
@@ -629,8 +601,8 @@ func enqueueAllIngressEgressProxySvcsInNS(ns string, cl client.Client, logger *z
 
 		// Get all headless Services for proxies configured using Service.
 		svcProxyLabels := map[string]string{
-			LabelManaged:    "true",
-			LabelParentType: "svc",
+			kubetypes.LabelManaged: "true",
+			LabelParentType:        "svc",
 		}
 		svcHeadlessSvcList := &corev1.ServiceList{}
 		if err := cl.List(ctx, svcHeadlessSvcList, client.InNamespace(ns), client.MatchingLabels(svcProxyLabels)); err != nil {
@@ -643,8 +615,8 @@ func enqueueAllIngressEgressProxySvcsInNS(ns string, cl client.Client, logger *z
 
 		// Get all headless Services for proxies configured using Ingress.
 		ingProxyLabels := map[string]string{
-			LabelManaged:    "true",
-			LabelParentType: "ingress",
+			kubetypes.LabelManaged: "true",
+			LabelParentType:        "ingress",
 		}
 		ingHeadlessSvcList := &corev1.ServiceList{}
 		if err := cl.List(ctx, ingHeadlessSvcList, client.InNamespace(ns), client.MatchingLabels(ingProxyLabels)); err != nil {
@@ -711,7 +683,7 @@ func dnsRecordsReconcilerIngressHandler(ns string, isDefaultLoadBalancer bool, c
 
 func isManagedResource(o client.Object) bool {
 	ls := o.GetLabels()
-	return ls[LabelManaged] == "true"
+	return ls[kubetypes.LabelManaged] == "true"
 }
 
 func isManagedByType(o client.Object, typ string) bool {
@@ -948,7 +920,7 @@ func egressPodsHandler(_ context.Context, o client.Object) []reconcile.Request {
 // returns reconciler requests for all egress EndpointSlices for that ProxyGroup.
 func egressEpsFromPGPods(cl client.Client, ns string) handler.MapFunc {
 	return func(_ context.Context, o client.Object) []reconcile.Request {
-		if v, ok := o.GetLabels()[LabelManaged]; !ok || v != "true" {
+		if v, ok := o.GetLabels()[kubetypes.LabelManaged]; !ok || v != "true" {
 			return nil
 		}
 		// TODO(irbekrm): for now this is good enough as all ProxyGroups are egress. Add a type check once we
@@ -968,15 +940,13 @@ func egressEpsFromPGPods(cl client.Client, ns string) handler.MapFunc {
 // returns reconciler requests for all egress EndpointSlices for that ProxyGroup.
 func egressEpsFromPGStateSecrets(cl client.Client, ns string) handler.MapFunc {
 	return func(_ context.Context, o client.Object) []reconcile.Request {
-		if v, ok := o.GetLabels()[LabelManaged]; !ok || v != "true" {
+		if v, ok := o.GetLabels()[kubetypes.LabelManaged]; !ok || v != "true" {
 			return nil
 		}
-		// TODO(irbekrm): for now this is good enough as all ProxyGroups are egress. Add a type check once we
-		// have ingress ProxyGroups.
 		if parentType := o.GetLabels()[LabelParentType]; parentType != "proxygroup" {
 			return nil
 		}
-		if secretType := o.GetLabels()[labelSecretType]; secretType != "state" {
+		if secretType := o.GetLabels()[kubetypes.LabelSecretType]; secretType != "state" {
 			return nil
 		}
 		pg, ok := o.GetLabels()[LabelParentName]
@@ -993,7 +963,7 @@ func egressSvcFromEps(_ context.Context, o client.Object) []reconcile.Request {
 	if typ := o.GetLabels()[labelSvcType]; typ != typeEgress {
 		return nil
 	}
-	if v, ok := o.GetLabels()[LabelManaged]; !ok || v != "true" {
+	if v, ok := o.GetLabels()[kubetypes.LabelManaged]; !ok || v != "true" {
 		return nil
 	}
 	svcName, ok := o.GetLabels()[LabelParentName]
@@ -1063,36 +1033,6 @@ func egressSvcsFromEgressProxyGroup(cl client.Client, logger *zap.SugaredLogger)
 	}
 }
 
-// ingressesFromIngressProxyGroup is an event handler for ingress ProxyGroups. It returns reconcile requests for all
-// user-created Ingresses that should be exposed on this ProxyGroup.
-func ingressesFromIngressProxyGroup(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
-	return func(ctx context.Context, o client.Object) []reconcile.Request {
-		pg, ok := o.(*tsapi.ProxyGroup)
-		if !ok {
-			logger.Infof("[unexpected] ProxyGroup handler triggered for an object that is not a ProxyGroup")
-			return nil
-		}
-		if pg.Spec.Type != tsapi.ProxyGroupTypeIngress {
-			return nil
-		}
-		ingList := &networkingv1.IngressList{}
-		if err := cl.List(ctx, ingList, client.MatchingFields{indexIngressProxyGroup: pg.Name}); err != nil {
-			logger.Infof("error listing Ingresses: %v, skipping a reconcile for event on ProxyGroup %s", err, pg.Name)
-			return nil
-		}
-		reqs := make([]reconcile.Request, 0)
-		for _, svc := range ingList.Items {
-			reqs = append(reqs, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Namespace: svc.Namespace,
-					Name:      svc.Name,
-				},
-			})
-		}
-		return reqs
-	}
-}
-
 // epsFromExternalNameService is an event handler for ExternalName Services that define a Tailscale egress service that
 // should be exposed on a ProxyGroup. It returns reconcile requests for EndpointSlices created for this Service.
 func epsFromExternalNameService(cl client.Client, logger *zap.SugaredLogger, ns string) handler.MapFunc {
@@ -1138,9 +1078,9 @@ func podsFromEgressEps(cl client.Client, logger *zap.SugaredLogger, ns string) h
 			return nil
 		}
 		podLabels := map[string]string{
-			LabelManaged:    "true",
-			LabelParentType: "proxygroup",
-			LabelParentName: eps.Labels[labelProxyGroup],
+			kubetypes.LabelManaged: "true",
+			LabelParentType:        "proxygroup",
+			LabelParentName:        eps.Labels[labelProxyGroup],
 		}
 		podList := &corev1.PodList{}
 		if err := cl.List(ctx, podList, client.InNamespace(ns),
@@ -1211,51 +1151,6 @@ func indexEgressServices(o client.Object) []string {
 		return nil
 	}
 	return []string{o.GetAnnotations()[AnnotationProxyGroup]}
-}
-
-// indexPGIngresses adds a local index to a cached Tailscale Ingresses meant to be exposed on a ProxyGroup. The index is
-// used a list filter.
-func indexPGIngresses(o client.Object) []string {
-	if !hasProxyGroupAnnotation(o) {
-		return nil
-	}
-	return []string{o.GetAnnotations()[AnnotationProxyGroup]}
-}
-
-// serviceHandlerForIngressPG returns a handler for Service events that ensures that if the Service
-// associated with an event is a backend Service for a tailscale Ingress with ProxyGroup annotation,
-// the associated Ingress gets reconciled.
-func serviceHandlerForIngressPG(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
-	return func(ctx context.Context, o client.Object) []reconcile.Request {
-		ingList := networkingv1.IngressList{}
-		if err := cl.List(ctx, &ingList, client.InNamespace(o.GetNamespace())); err != nil {
-			logger.Debugf("error listing Ingresses: %v", err)
-			return nil
-		}
-		reqs := make([]reconcile.Request, 0)
-		for _, ing := range ingList.Items {
-			if ing.Spec.IngressClassName == nil || *ing.Spec.IngressClassName != tailscaleIngressClassName {
-				continue
-			}
-			if !hasProxyGroupAnnotation(&ing) {
-				continue
-			}
-			if ing.Spec.DefaultBackend != nil && ing.Spec.DefaultBackend.Service != nil && ing.Spec.DefaultBackend.Service.Name == o.GetName() {
-				reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&ing)})
-			}
-			for _, rule := range ing.Spec.Rules {
-				if rule.HTTP == nil {
-					continue
-				}
-				for _, path := range rule.HTTP.Paths {
-					if path.Backend.Service != nil && path.Backend.Service.Name == o.GetName() {
-						reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&ing)})
-					}
-				}
-			}
-		}
-		return reqs
-	}
 }
 
 func hasProxyGroupAnnotation(obj client.Object) bool {

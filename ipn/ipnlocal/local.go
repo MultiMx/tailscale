@@ -57,10 +57,12 @@ import (
 	"tailscale.com/health/healthmsg"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/auditlog"
 	"tailscale.com/ipn/conffile"
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/policy"
+	memstore "tailscale.com/ipn/store/mem"
 	"tailscale.com/log/sockstatlog"
 	"tailscale.com/logpolicy"
 	"tailscale.com/net/captivedetection"
@@ -450,6 +452,12 @@ type LocalBackend struct {
 	// Each callback is called exactly once in unspecified order and without b.mu held.
 	// Returned errors are logged but otherwise ignored and do not affect the shutdown process.
 	shutdownCbs set.HandleSet[func() error]
+
+	// auditLogger, if non-nil, manages audit logging for the backend.
+	//
+	// It queues, persists, and sends audit logs
+	// to the control client.  auditLogger has the same lifespan as b.cc.
+	auditLogger *auditlog.Logger
 }
 
 // HealthTracker returns the health tracker for the backend.
@@ -950,7 +958,9 @@ func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 
 	if peerAPIListenAsync && b.netMap != nil && b.state == ipn.Running {
 		want := b.netMap.GetAddresses().Len()
-		if len(b.peerAPIListeners) < want {
+		have := len(b.peerAPIListeners)
+		b.logf("[v1] linkChange: have %d peerAPIListeners, want %d", have, want)
+		if have < want {
 			b.logf("linkChange: peerAPIListeners too low; trying again")
 			b.goTracker.Go(b.initPeerAPIListener)
 		}
@@ -1679,6 +1689,15 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 			b.logf("Failed to save new controlclient state: %v", err)
 		}
 	}
+
+	// Update the audit logger with the current profile ID.
+	if b.auditLogger != nil && prefsChanged {
+		pid := b.pm.CurrentProfile().ID()
+		if err := b.auditLogger.SetProfileID(pid); err != nil {
+			b.logf("Failed to set profile ID in audit logger: %v", err)
+		}
+	}
+
 	// initTKALocked is dependent on CurrentProfile.ID, which is initialized
 	// (for new profiles) on the first call to b.pm.SetPrefs.
 	if err := b.initTKALocked(); err != nil {
@@ -2363,12 +2382,10 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	}
 	b.applyPrefsToHostinfoLocked(hostinfo, prefs)
 
-	b.setNetMapLocked(nil)
 	persistv := prefs.Persist().AsStruct()
 	if persistv == nil {
 		persistv = new(persist.Persist)
 	}
-	b.updateFilterLocked(nil, ipn.PrefsView{})
 
 	if b.portpoll != nil {
 		b.portpollOnce.Do(func() {
@@ -2384,6 +2401,25 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	debugFlags := controlDebugFlags
 	if isNetstack {
 		debugFlags = append([]string{"netstack"}, debugFlags...)
+	}
+
+	var auditLogShutdown func()
+	store, ok := b.sys.AuditLogStore.GetOK()
+	if !ok {
+		// Use memory store by default if no explicit store is provided.
+		store = auditlog.NewLogStore(&memstore.Store{})
+	}
+
+	al := auditlog.NewLogger(auditlog.Opts{
+		Logf:       b.logf,
+		RetryLimit: 32,
+		Store:      store,
+	})
+	b.auditLogger = al
+	auditLogShutdown = func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		al.FlushAndStop(ctx)
 	}
 
 	// TODO(apenwarr): The only way to change the ServerURL is to
@@ -2411,6 +2447,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		C2NHandler:                 http.HandlerFunc(b.handleC2N),
 		DialPlan:                   &b.dialPlan, // pointer because it can't be copied
 		ControlKnobs:               b.sys.ControlKnobs(),
+		Shutdown:                   auditLogShutdown,
 
 		// Don't warn about broken Linux IP forwarding when
 		// netstack is being used.
@@ -3442,18 +3479,20 @@ func (b *LocalBackend) onTailnetDefaultAutoUpdate(au bool) {
 		// can still manually enable auto-updates on this node.
 		return
 	}
-	b.logf("using tailnet default auto-update setting: %v", au)
-	prefsClone := prefs.AsStruct()
-	prefsClone.AutoUpdate.Apply = opt.NewBool(au)
-	_, err := b.editPrefsLockedOnEntry(&ipn.MaskedPrefs{
-		Prefs: *prefsClone,
-		AutoUpdateSet: ipn.AutoUpdatePrefsMask{
-			ApplySet: true,
-		},
-	}, unlock)
-	if err != nil {
-		b.logf("failed to apply tailnet-wide default for auto-updates (%v): %v", au, err)
-		return
+	if clientupdate.CanAutoUpdate() {
+		b.logf("using tailnet default auto-update setting: %v", au)
+		prefsClone := prefs.AsStruct()
+		prefsClone.AutoUpdate.Apply = opt.NewBool(au)
+		_, err := b.editPrefsLockedOnEntry(&ipn.MaskedPrefs{
+			Prefs: *prefsClone,
+			AutoUpdateSet: ipn.AutoUpdatePrefsMask{
+				ApplySet: true,
+			},
+		}, unlock)
+		if err != nil {
+			b.logf("failed to apply tailnet-wide default for auto-updates (%v): %v", au, err)
+			return
+		}
 	}
 }
 
@@ -4263,6 +4302,21 @@ func (b *LocalBackend) MaybeClearAppConnector(mp *ipn.MaskedPrefs) error {
 	return err
 }
 
+var errNoAuditLogger = errors.New("no audit logger configured")
+
+func (b *LocalBackend) getAuditLoggerLocked() ipnauth.AuditLogFunc {
+	logger := b.auditLogger
+	return func(action tailcfg.ClientAuditAction, details string) error {
+		if logger == nil {
+			return errNoAuditLogger
+		}
+		if err := logger.Enqueue(action, details); err != nil {
+			return fmt.Errorf("failed to enqueue audit log %v %q: %w", action, details, err)
+		}
+		return nil
+	}
+}
+
 // EditPrefs applies the changes in mp to the current prefs,
 // acting as the tailscaled itself rather than a specific user.
 func (b *LocalBackend) EditPrefs(mp *ipn.MaskedPrefs) (ipn.PrefsView, error) {
@@ -4288,9 +4342,8 @@ func (b *LocalBackend) EditPrefsAs(mp *ipn.MaskedPrefs, actor ipnauth.Actor) (ip
 	unlock := b.lockAndGetUnlock()
 	defer unlock()
 	if mp.WantRunningSet && !mp.WantRunning && b.pm.CurrentPrefs().WantRunning() {
-		// TODO(barnstar,nickkhyl): replace loggerFn with the actual audit logger.
-		loggerFn := func(action, details string) { b.logf("[audit]: %s: %s", action, details) }
-		if err := actor.CheckProfileAccess(b.pm.CurrentProfile(), ipnauth.Disconnect, loggerFn); err != nil {
+		if err := actor.CheckProfileAccess(b.pm.CurrentProfile(), ipnauth.Disconnect, b.getAuditLoggerLocked()); err != nil {
+			b.logf("check profile access failed: %v", err)
 			return ipn.PrefsView{}, err
 		}
 
@@ -4915,7 +4968,7 @@ func (b *LocalBackend) authReconfig() {
 		return
 	}
 
-	oneCGNATRoute := shouldUseOneCGNATRoute(b.logf, b.sys.ControlKnobs(), version.OS())
+	oneCGNATRoute := shouldUseOneCGNATRoute(b.logf, b.sys.NetMon.Get(), b.sys.ControlKnobs(), version.OS())
 	rcfg := b.routerConfig(cfg, prefs, oneCGNATRoute)
 
 	err = b.e.Reconfig(cfg, rcfg, dcfg)
@@ -4939,7 +4992,7 @@ func (b *LocalBackend) authReconfig() {
 //
 // The versionOS is a Tailscale-style version ("iOS", "macOS") and not
 // a runtime.GOOS.
-func shouldUseOneCGNATRoute(logf logger.Logf, controlKnobs *controlknobs.Knobs, versionOS string) bool {
+func shouldUseOneCGNATRoute(logf logger.Logf, mon *netmon.Monitor, controlKnobs *controlknobs.Knobs, versionOS string) bool {
 	if controlKnobs != nil {
 		// Explicit enabling or disabling always take precedence.
 		if v, ok := controlKnobs.OneCGNAT.Load().Get(); ok {
@@ -4954,7 +5007,7 @@ func shouldUseOneCGNATRoute(logf logger.Logf, controlKnobs *controlknobs.Knobs, 
 	// use fine-grained routes if another interfaces is also using the CGNAT
 	// IP range.
 	if versionOS == "macOS" {
-		hasCGNATInterface, err := netmon.HasCGNATInterface()
+		hasCGNATInterface, err := mon.HasCGNATInterface()
 		if err != nil {
 			logf("shouldUseOneCGNATRoute: Could not determine if any interfaces use CGNAT: %v", err)
 			return false
@@ -5316,6 +5369,7 @@ func (b *LocalBackend) initPeerAPIListener() {
 			ln, err = ps.listen(a.Addr(), b.prevIfState)
 			if err != nil {
 				if peerAPIListenAsync {
+					b.logf("possibly transient peerapi listen(%q) error, will try again on linkChange: %v", a.Addr(), err)
 					// Expected. But we fix it later in linkChange
 					// ("peerAPIListeners too low").
 					continue
@@ -5867,6 +5921,9 @@ func (b *LocalBackend) requestEngineStatusAndWait() {
 	b.logf("requestEngineStatusAndWait: got status update.")
 }
 
+// [controlclient.Auto] implements [auditlog.Transport].
+var _ auditlog.Transport = (*controlclient.Auto)(nil)
+
 // setControlClientLocked sets the control client to cc,
 // which may be nil.
 //
@@ -5874,6 +5931,15 @@ func (b *LocalBackend) requestEngineStatusAndWait() {
 func (b *LocalBackend) setControlClientLocked(cc controlclient.Client) {
 	b.cc = cc
 	b.ccAuto, _ = cc.(*controlclient.Auto)
+	if t, ok := b.cc.(auditlog.Transport); ok && b.auditLogger != nil {
+		if err := b.auditLogger.SetProfileID(b.pm.CurrentProfile().ID()); err != nil {
+			b.logf("audit logger set profile ID failure: %v", err)
+		}
+
+		if err := b.auditLogger.Start(t); err != nil {
+			b.logf("audit logger start failure: %v", err)
+		}
+	}
 }
 
 // resetControlClientLocked sets b.cc to nil and returns the old value. If the
@@ -7469,6 +7535,7 @@ func (b *LocalBackend) resetForProfileChangeLockedOnEntry(unlock unlockOnce) err
 		return nil
 	}
 	b.setNetMapLocked(nil) // Reset netmap.
+	b.updateFilterLocked(nil, ipn.PrefsView{})
 	// Reset the NetworkMap in the engine
 	b.e.SetNetworkMap(new(netmap.NetworkMap))
 	if prevCC := b.resetControlClientLocked(); prevCC != nil {
@@ -8238,7 +8305,14 @@ func (b *LocalBackend) vipServicesFromPrefsLocked(prefs ipn.PrefsView) []*tailcf
 		services[sn].Active = true
 	}
 
-	return slicesx.MapValues(services)
+	servicesList := slicesx.MapValues(services)
+	// [slicesx.MapValues] provides the values in an indeterminate order, but since we'll
+	// be hashing a representation of this list later we want it to be in a consistent
+	// order.
+	slices.SortFunc(servicesList, func(a, b *tailcfg.VIPService) int {
+		return strings.Compare(a.Name.String(), b.Name.String())
+	})
+	return servicesList
 }
 
 var (

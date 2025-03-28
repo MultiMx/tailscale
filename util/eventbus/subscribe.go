@@ -10,6 +10,12 @@ import (
 	"sync"
 )
 
+type DeliveredEvent struct {
+	Event any
+	From  *Client
+	To    *Client
+}
+
 // subscriber is a uniformly typed wrapper around Subscriber[T], so
 // that debugging facilities can look at active subscribers.
 type subscriber interface {
@@ -27,7 +33,7 @@ type subscriber interface {
 	// processing other potential sources of wakeups, which is how we end
 	// up at this awkward type signature and sharing of internal state
 	// through dispatch.
-	dispatch(vals *queue, stop goroutineShutdownWorker, acceptCh func() chan any) bool
+	dispatch(ctx context.Context, vals *queue[DeliveredEvent], acceptCh func() chan DeliveredEvent, snapshot chan chan []DeliveredEvent) bool
 	Close()
 }
 
@@ -35,31 +41,29 @@ type subscriber interface {
 type subscribeState struct {
 	client *Client
 
-	write    chan any
-	stop     goroutineShutdownControl
-	snapshot chan chan []any
+	dispatcher *worker
+	write      chan DeliveredEvent
+	snapshot   chan chan []DeliveredEvent
+	debug      hook[DeliveredEvent]
 
 	outputsMu sync.Mutex
 	outputs   map[reflect.Type]subscriber
 }
 
 func newSubscribeState(c *Client) *subscribeState {
-	stopCtl, stopWorker := newGoroutineShutdown()
 	ret := &subscribeState{
 		client:   c,
-		write:    make(chan any),
-		stop:     stopCtl,
-		snapshot: make(chan chan []any),
+		write:    make(chan DeliveredEvent),
+		snapshot: make(chan chan []DeliveredEvent),
 		outputs:  map[reflect.Type]subscriber{},
 	}
-	go ret.pump(stopWorker)
+	ret.dispatcher = runWorker(ret.pump)
 	return ret
 }
 
-func (q *subscribeState) pump(stop goroutineShutdownWorker) {
-	defer stop.Done()
-	var vals queue
-	acceptCh := func() chan any {
+func (q *subscribeState) pump(ctx context.Context) {
+	var vals queue[DeliveredEvent]
+	acceptCh := func() chan DeliveredEvent {
 		if vals.Full() {
 			return nil
 		}
@@ -68,14 +72,22 @@ func (q *subscribeState) pump(stop goroutineShutdownWorker) {
 	for {
 		if !vals.Empty() {
 			val := vals.Peek()
-			sub := q.subscriberFor(val)
+			sub := q.subscriberFor(val.Event)
 			if sub == nil {
 				// Raced with unsubscribe.
 				vals.Drop()
 				continue
 			}
-			if !sub.dispatch(&vals, stop, acceptCh) {
+			if !sub.dispatch(ctx, &vals, acceptCh, q.snapshot) {
 				return
+			}
+
+			if q.debug.active() {
+				q.debug.run(DeliveredEvent{
+					Event: val.Event,
+					From:  val.From,
+					To:    q.client,
+				})
 			}
 		} else {
 			// Keep the cases in this select in sync with
@@ -85,13 +97,41 @@ func (q *subscribeState) pump(stop goroutineShutdownWorker) {
 			select {
 			case val := <-q.write:
 				vals.Add(val)
-			case <-stop.Stop():
+			case <-ctx.Done():
 				return
 			case ch := <-q.snapshot:
 				ch <- vals.Snapshot()
 			}
 		}
 	}
+}
+
+func (s *subscribeState) snapshotQueue() []DeliveredEvent {
+	if s == nil {
+		return nil
+	}
+
+	resp := make(chan []DeliveredEvent)
+	select {
+	case s.snapshot <- resp:
+		return <-resp
+	case <-s.dispatcher.Done():
+		return nil
+	}
+}
+
+func (s *subscribeState) subscribeTypes() []reflect.Type {
+	if s == nil {
+		return nil
+	}
+
+	s.outputsMu.Lock()
+	defer s.outputsMu.Unlock()
+	ret := make([]reflect.Type, 0, len(s.outputs))
+	for t := range s.outputs {
+		ret = append(ret, t)
+	}
+	return ret
 }
 
 func (s *subscribeState) addSubscriber(t reflect.Type, sub subscriber) {
@@ -120,7 +160,7 @@ func (q *subscribeState) subscriberFor(val any) subscriber {
 // Close closes the subscribeState. Implicitly closes all Subscribers
 // linked to this state, and any pending events are discarded.
 func (s *subscribeState) close() {
-	s.stop.StopAndWait()
+	s.dispatcher.StopAndWait()
 
 	var subs map[reflect.Type]subscriber
 	s.outputsMu.Lock()
@@ -131,26 +171,34 @@ func (s *subscribeState) close() {
 	}
 }
 
+func (s *subscribeState) closed() <-chan struct{} {
+	return s.dispatcher.Done()
+}
+
 // A Subscriber delivers one type of event from a [Client].
 type Subscriber[T any] struct {
-	doneCtx context.Context
-	done    context.CancelFunc
-	recv    *subscribeState
-	read    chan T
+	stop       stopFlag
+	read       chan T
+	unregister func()
 }
 
 func newSubscriber[T any](r *subscribeState) *Subscriber[T] {
 	t := reflect.TypeFor[T]()
 
-	ctx, cancel := context.WithCancel(context.Background())
 	ret := &Subscriber[T]{
-		doneCtx: ctx,
-		done:    cancel,
-		recv:    r,
-		read:    make(chan T),
+		read:       make(chan T),
+		unregister: func() { r.deleteSubscriber(t) },
 	}
 	r.addSubscriber(t, ret)
 
+	return ret
+}
+
+func newMonitor[T any](attach func(fn func(T)) (cancel func())) *Subscriber[T] {
+	ret := &Subscriber[T]{
+		read: make(chan T, 100), // arbitrary, large
+	}
+	ret.unregister = attach(ret.monitor)
 	return ret
 }
 
@@ -158,8 +206,15 @@ func (s *Subscriber[T]) subscribeType() reflect.Type {
 	return reflect.TypeFor[T]()
 }
 
-func (s *Subscriber[T]) dispatch(vals *queue, stop goroutineShutdownWorker, acceptCh func() chan any) bool {
-	t := vals.Peek().(T)
+func (s *Subscriber[T]) monitor(debugEvent T) {
+	select {
+	case s.read <- debugEvent:
+	case <-s.stop.Done():
+	}
+}
+
+func (s *Subscriber[T]) dispatch(ctx context.Context, vals *queue[DeliveredEvent], acceptCh func() chan DeliveredEvent, snapshot chan chan []DeliveredEvent) bool {
+	t := vals.Peek().Event.(T)
 	for {
 		// Keep the cases in this select in sync with subscribeState.pump
 		// above. The only different should be that this select
@@ -170,9 +225,9 @@ func (s *Subscriber[T]) dispatch(vals *queue, stop goroutineShutdownWorker, acce
 			return true
 		case val := <-acceptCh():
 			vals.Add(val)
-		case <-stop.Stop():
+		case <-ctx.Done():
 			return false
-		case ch := <-s.recv.snapshot:
+		case ch := <-snapshot:
 			ch <- vals.Snapshot()
 		}
 	}
@@ -187,13 +242,13 @@ func (s *Subscriber[T]) Events() <-chan T {
 // Done returns a channel that is closed when the subscriber is
 // closed.
 func (s *Subscriber[T]) Done() <-chan struct{} {
-	return s.doneCtx.Done()
+	return s.stop.Done()
 }
 
 // Close closes the Subscriber, indicating the caller no longer wishes
 // to receive this event type. After Close, receives on
 // [Subscriber.Events] block for ever.
 func (s *Subscriber[T]) Close() {
-	s.done() // unblock receivers
-	s.recv.deleteSubscriber(reflect.TypeFor[T]())
+	s.stop.Stop() // unblock receivers
+	s.unregister()
 }

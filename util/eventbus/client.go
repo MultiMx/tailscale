@@ -17,13 +17,16 @@ import (
 // Subscribers that share the same client receive events one at a
 // time, in the order they were published.
 type Client struct {
-	name string
-	bus  *Bus
+	name         string
+	bus          *Bus
+	publishDebug hook[PublishedEvent]
 
 	mu  sync.Mutex
 	pub set.Set[publisher]
 	sub *subscribeState // Lazily created on first subscribe
 }
+
+func (c *Client) Name() string { return c.name }
 
 // Close closes the client. Implicitly closes all publishers and
 // subscribers obtained from this client.
@@ -44,6 +47,30 @@ func (c *Client) Close() {
 	for p := range pub {
 		p.Close()
 	}
+}
+
+func (c *Client) snapshotSubscribeQueue() []DeliveredEvent {
+	return c.peekSubscribeState().snapshotQueue()
+}
+
+func (c *Client) peekSubscribeState() *subscribeState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sub
+}
+
+func (c *Client) publishTypes() []reflect.Type {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ret := make([]reflect.Type, 0, len(c.pub))
+	for pub := range c.pub {
+		ret = append(ret, pub.publishType())
+	}
+	return ret
+}
+
+func (c *Client) subscribeTypes() []reflect.Type {
+	return c.peekSubscribeState().subscribeTypes()
 }
 
 func (c *Client) subscribeState() *subscribeState {
@@ -75,12 +102,12 @@ func (c *Client) deleteSubscriber(t reflect.Type, s *subscribeState) {
 	c.bus.unsubscribe(t, s)
 }
 
-func (c *Client) publish() chan<- any {
+func (c *Client) publish() chan<- PublishedEvent {
 	return c.bus.write
 }
 
 func (c *Client) shouldPublish(t reflect.Type) bool {
-	return c.bus.shouldPublish(t)
+	return c.publishDebug.active() || c.bus.shouldPublish(t)
 }
 
 // Subscribe requests delivery of events of type T through the given
