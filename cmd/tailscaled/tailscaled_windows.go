@@ -44,7 +44,8 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 	"tailscale.com/drive/driveimpl"
 	"tailscale.com/envknob"
-	"tailscale.com/ipn/desktop"
+	_ "tailscale.com/ipn/auditlog"
+	_ "tailscale.com/ipn/desktop"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/dns"
@@ -327,21 +328,14 @@ func beWindowsSubprocess() bool {
 		log.Printf("Error pre-loading \"%s\": %v", fqWintunPath, err)
 	}
 
-	sys := new(tsd.System)
-	netMon, err := netmon.New(log.Printf)
+	sys := tsd.NewSystem()
+	netMon, err := netmon.New(sys.Bus.Get(), log.Printf)
 	if err != nil {
 		log.Fatalf("Could not create netMon: %v", err)
 	}
 	sys.Set(netMon)
 
 	sys.Set(driveimpl.NewFileSystemForRemote(log.Printf))
-
-	if sessionManager, err := desktop.NewSessionManager(log.Printf); err == nil {
-		sys.Set(sessionManager)
-	} else {
-		// Errors creating the session manager are unexpected, but not fatal.
-		log.Printf("[unexpected]: error creating a desktop session manager: %v", err)
-	}
 
 	publicLogID, _ := logid.ParsePublicID(logID)
 	err = startIPNServer(ctx, log.Printf, publicLogID, sys)

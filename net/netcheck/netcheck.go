@@ -25,6 +25,7 @@ import (
 
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/envknob"
+	"tailscale.com/hostinfo"
 	"tailscale.com/net/captivedetection"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/neterror"
@@ -863,7 +864,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 		c.curState = nil
 	}()
 
-	if runtime.GOOS == "js" || runtime.GOOS == "tamago" {
+	if runtime.GOOS == "js" || runtime.GOOS == "tamago" || (runtime.GOOS == "plan9" && hostinfo.IsInVM86()) {
 		if err := c.runHTTPOnlyChecks(ctx, last, rs, dm); err != nil {
 			return nil, err
 		}
@@ -1045,7 +1046,7 @@ func (c *Client) finishAndStoreReport(rs *reportState, dm *tailcfg.DERPMap) *Rep
 }
 
 // runHTTPOnlyChecks is the netcheck done by environments that can
-// only do HTTP requests, such as ws/wasm.
+// only do HTTP requests, such as js/wasm.
 func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *reportState, dm *tailcfg.DERPMap) error {
 	var regions []*tailcfg.DERPRegion
 	if rs.incremental && last != nil {
@@ -1057,9 +1058,25 @@ func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *report
 	}
 	if len(regions) == 0 {
 		for _, dr := range dm.Regions {
+			if dr.NoMeasureNoHome {
+				continue
+			}
 			regions = append(regions, dr)
 		}
 	}
+
+	if len(regions) == 1 && hostinfo.IsInVM86() {
+		// If we only have 1 region that's probably and we're in a
+		// network-limited v86 environment, don't actually probe it. Just fake
+		// some results.
+		rg := regions[0]
+		if len(rg.Nodes) > 0 {
+			node := rg.Nodes[0]
+			rs.addNodeLatency(node, netip.AddrPort{}, 999*time.Millisecond)
+			return nil
+		}
+	}
+
 	c.logf("running HTTP-only netcheck against %v regions", len(regions))
 
 	var wg sync.WaitGroup
@@ -1186,6 +1203,10 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 
 func (c *Client) measureAllICMPLatency(ctx context.Context, rs *reportState, need []*tailcfg.DERPRegion) error {
 	if len(need) == 0 {
+		return nil
+	}
+	if runtime.GOOS == "plan9" {
+		// ICMP isn't implemented.
 		return nil
 	}
 	ctx, done := context.WithTimeout(ctx, icmpProbeTimeout)

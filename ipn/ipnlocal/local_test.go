@@ -436,7 +436,7 @@ func (panicOnUseTransport) RoundTrip(*http.Request) (*http.Response, error) {
 }
 
 func newTestLocalBackend(t testing.TB) *LocalBackend {
-	return newTestLocalBackendWithSys(t, new(tsd.System))
+	return newTestLocalBackendWithSys(t, tsd.NewSystem())
 }
 
 // newTestLocalBackendWithSys creates a new LocalBackend with the given tsd.System.
@@ -448,7 +448,7 @@ func newTestLocalBackendWithSys(t testing.TB, sys *tsd.System) *LocalBackend {
 		sys.Set(new(mem.Store))
 	}
 	if _, ok := sys.Engine.GetOK(); !ok {
-		eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry())
+		eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
 		if err != nil {
 			t.Fatalf("NewFakeUserspaceEngine: %v", err)
 		}
@@ -573,54 +573,6 @@ func TestSetUseExitNodeEnabled(t *testing.T) {
 	}); err == nil {
 		t.Fatalf("unexpected success; want an error trying to set an internal field")
 	}
-}
-
-func TestFileTargets(t *testing.T) {
-	b := new(LocalBackend)
-	_, err := b.FileTargets()
-	if got, want := fmt.Sprint(err), "not connected to the tailnet"; got != want {
-		t.Errorf("before connect: got %q; want %q", got, want)
-	}
-
-	b.netMap = new(netmap.NetworkMap)
-	_, err = b.FileTargets()
-	if got, want := fmt.Sprint(err), "not connected to the tailnet"; got != want {
-		t.Errorf("non-running netmap: got %q; want %q", got, want)
-	}
-
-	b.state = ipn.Running
-	_, err = b.FileTargets()
-	if got, want := fmt.Sprint(err), "file sharing not enabled by Tailscale admin"; got != want {
-		t.Errorf("without cap: got %q; want %q", got, want)
-	}
-
-	b.capFileSharing = true
-	got, err := b.FileTargets()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("unexpected %d peers", len(got))
-	}
-
-	var peerMap map[tailcfg.NodeID]tailcfg.NodeView
-	mak.NonNil(&peerMap)
-	var nodeID tailcfg.NodeID
-	nodeID = 1234
-	peer := &tailcfg.Node{
-		ID:       1234,
-		Hostinfo: (&tailcfg.Hostinfo{OS: "tvOS"}).View(),
-	}
-	peerMap[nodeID] = peer.View()
-	b.peers = peerMap
-	got, err = b.FileTargets()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("unexpected %d peers", len(got))
-	}
-	// (other cases handled by TestPeerAPIBase above)
 }
 
 func TestInternalAndExternalInterfaces(t *testing.T) {
@@ -2665,7 +2617,7 @@ func TestOnTailnetDefaultAutoUpdate(t *testing.T) {
 			// On platforms that don't support auto-update we can never
 			// transition to auto-updates being enabled. The value should
 			// remain unchanged after onTailnetDefaultAutoUpdate.
-			if !clientupdate.CanAutoUpdate() && want.EqualBool(true) {
+			if !clientupdate.CanAutoUpdate() {
 				want = tt.before
 			}
 			if got := b.pm.CurrentPrefs().AutoUpdate().Apply; got != want {
@@ -4124,7 +4076,7 @@ func TestReadWriteRouteInfo(t *testing.T) {
 	}
 
 	// write the other routeInfo as the other profile
-	if err := b.pm.SwitchProfile("id2"); err != nil {
+	if _, _, err := b.pm.SwitchToProfileByID("id2"); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.storeRouteInfo(ri2); err != nil {
@@ -4132,7 +4084,7 @@ func TestReadWriteRouteInfo(t *testing.T) {
 	}
 
 	// read the routeInfo of the first profile
-	if err := b.pm.SwitchProfile("id1"); err != nil {
+	if _, _, err := b.pm.SwitchToProfileByID("id1"); err != nil {
 		t.Fatal(err)
 	}
 	readRi, err = b.readRouteInfoLocked()
@@ -4144,7 +4096,7 @@ func TestReadWriteRouteInfo(t *testing.T) {
 	}
 
 	// read the routeInfo of the second profile
-	if err := b.pm.SwitchProfile("id2"); err != nil {
+	if _, _, err := b.pm.SwitchToProfileByID("id2"); err != nil {
 		t.Fatal(err)
 	}
 	readRi, err = b.readRouteInfoLocked()
@@ -4407,19 +4359,27 @@ func TestNotificationTargetMatch(t *testing.T) {
 type newTestControlFn func(tb testing.TB, opts controlclient.Options) controlclient.Client
 
 func newLocalBackendWithTestControl(t *testing.T, enableLogging bool, newControl newTestControlFn) *LocalBackend {
+	return newLocalBackendWithSysAndTestControl(t, enableLogging, tsd.NewSystem(), newControl)
+}
+
+func newLocalBackendWithSysAndTestControl(t *testing.T, enableLogging bool, sys *tsd.System, newControl newTestControlFn) *LocalBackend {
 	logf := logger.Discard
 	if enableLogging {
 		logf = tstest.WhileTestRunningLogger(t)
 	}
-	sys := new(tsd.System)
-	store := new(mem.Store)
-	sys.Set(store)
-	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry())
-	if err != nil {
-		t.Fatalf("NewFakeUserspaceEngine: %v", err)
+
+	if _, hasStore := sys.StateStore.GetOK(); !hasStore {
+		store := new(mem.Store)
+		sys.Set(store)
 	}
-	t.Cleanup(e.Close)
-	sys.Set(e)
+	if _, hasEngine := sys.Engine.GetOK(); !hasEngine {
+		e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
+		if err != nil {
+			t.Fatalf("NewFakeUserspaceEngine: %v", err)
+		}
+		t.Cleanup(e.Close)
+		sys.Set(e)
+	}
 
 	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
@@ -4859,9 +4819,8 @@ func TestConfigFileReload(t *testing.T) {
 			// Create backend with initial config
 			tc.initial.Path = path
 			tc.initial.Raw = initialJSON
-			sys := &tsd.System{
-				InitialConfig: tc.initial,
-			}
+			sys := tsd.NewSystem()
+			sys.InitialConfig = tc.initial
 			b := newTestLocalBackendWithSys(t, sys)
 
 			// Update config file
