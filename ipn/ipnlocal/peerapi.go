@@ -60,8 +60,6 @@ type peerDNSQueryHandler interface {
 type peerAPIServer struct {
 	b        *LocalBackend
 	resolver peerDNSQueryHandler
-
-	taildrop *taildrop_Manager
 }
 
 func (s *peerAPIServer) listen(ip netip.Addr, ifState *netmon.State) (ln net.Listener, err error) {
@@ -770,7 +768,7 @@ func (h *peerAPIHandler) replyToDNSQueries() bool {
 	// but an app connector explicitly adds 0.0.0.0/32 (and the
 	// IPv6 equivalent) to make this work (see updateFilterLocked
 	// in LocalBackend).
-	f := b.filterAtomic.Load()
+	f := b.currentNode().filter()
 	if f == nil {
 		return false
 	}
