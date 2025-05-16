@@ -1480,7 +1480,7 @@ func (de *endpoint) addCandidateEndpoint(ep netip.AddrPort, forRxPingTxID stun.T
 			}
 		}
 		size2 := len(de.endpointState)
-		de.c.dlogf("[v1] magicsock: disco: addCandidateEndpoint pruned %v candidate set from %v to %v entries", size, size2)
+		de.c.dlogf("[v1] magicsock: disco: addCandidateEndpoint pruned %v (%s) candidate set from %v to %v entries", de.discoShort(), de.publicKey.ShortString(), size, size2)
 	}
 	return false
 }
@@ -1871,7 +1871,7 @@ func (de *endpoint) resetLocked() {
 		}
 	}
 	de.probeUDPLifetime.resetCycleEndpointLocked()
-	de.c.relayManager.cancelOutstandingWork(de)
+	de.c.relayManager.stopWork(de)
 }
 
 func (de *endpoint) numStopAndReset() int64 {
