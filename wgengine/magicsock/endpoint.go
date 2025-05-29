@@ -552,7 +552,7 @@ func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr, derpAddr netip.Ad
 // addrForWireGuardSendLocked returns the address that should be used for
 // sending the next packet. If a packet has never or not recently been sent to
 // the endpoint, then a randomly selected address for the endpoint is returned,
-// as well as a bool indiciating that WireGuard discovery pings should be started.
+// as well as a bool indicating that WireGuard discovery pings should be started.
 // If the addresses have latency information available, then the address with the
 // best latency is used.
 //
@@ -820,7 +820,7 @@ func (de *endpoint) heartbeat() {
 
 	udpAddr, _, _ := de.addrForSendLocked(now)
 	if udpAddr.IsValid() {
-		// We have a preferred path. Ping that every 2 seconds.
+		// We have a preferred path. Ping that every 'heartbeatInterval'.
 		de.startDiscoPingLocked(udpAddr, now, pingHeartbeat, 0, nil)
 	}
 
@@ -1112,7 +1112,7 @@ func (de *endpoint) sendDiscoPing(ep netip.AddrPort, discoKey key.DiscoPublic, t
 	size = min(size, MaxDiscoPingSize)
 	padding := max(size-discoPingSize, 0)
 
-	sent, _ := de.c.sendDiscoMessage(ep, nil, de.publicKey, discoKey, &disco.Ping{
+	sent, _ := de.c.sendDiscoMessage(ep, virtualNetworkID{}, de.publicKey, discoKey, &disco.Ping{
 		TxID:    [12]byte(txid),
 		NodeKey: de.c.publicKeyAtomic.Load(),
 		Padding: padding,
@@ -1261,7 +1261,7 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 }
 
 // sendWireGuardOnlyPingsLocked evaluates all available addresses for
-// a WireGuard only endpoint and initates an ICMP ping for useable
+// a WireGuard only endpoint and initiates an ICMP ping for useable
 // addresses.
 func (de *endpoint) sendWireGuardOnlyPingsLocked(now mono.Time) {
 	if runtime.GOOS == "js" {
@@ -1480,7 +1480,7 @@ func (de *endpoint) addCandidateEndpoint(ep netip.AddrPort, forRxPingTxID stun.T
 			}
 		}
 		size2 := len(de.endpointState)
-		de.c.dlogf("[v1] magicsock: disco: addCandidateEndpoint pruned %v candidate set from %v to %v entries", size, size2)
+		de.c.dlogf("[v1] magicsock: disco: addCandidateEndpoint pruned %v (%s) candidate set from %v to %v entries", de.discoShort(), de.publicKey.ShortString(), size, size2)
 	}
 	return false
 }
@@ -1562,9 +1562,17 @@ func pktLenToPingSize(mtu tstun.WireMTU, is6 bool) int {
 // It should be called with the Conn.mu held.
 //
 // It reports whether m.TxID corresponds to a ping that this endpoint sent.
-func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src netip.AddrPort) (knownTxID bool) {
+func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src netip.AddrPort, vni virtualNetworkID) (knownTxID bool) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
+
+	if vni.isSet() {
+		// TODO(jwhited): check for matching [endpoint.bestAddr] once that data
+		//  structure is VNI-aware and [relayManager] can mutate it. We do not
+		//  need to reference any [endpointState] for Geneve-encapsulated disco,
+		//  we store nothing about them there.
+		return false
+	}
 
 	isDerp := src.Addr() == tailcfg.DerpMagicIPAddr
 
@@ -1629,7 +1637,7 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src netip
 			de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
 			de.debugUpdates.Add(EndpointChange{
 				When: time.Now(),
-				What: "handlePingLocked-bestAddr-update",
+				What: "handlePongConnLocked-bestAddr-update",
 				From: de.bestAddr,
 				To:   thisPong,
 			})
@@ -1638,7 +1646,7 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src netip
 		if de.bestAddr.AddrPort == thisPong.AddrPort {
 			de.debugUpdates.Add(EndpointChange{
 				When: time.Now(),
-				What: "handlePingLocked-bestAddr-latency",
+				What: "handlePongConnLocked-bestAddr-latency",
 				From: de.bestAddr,
 				To:   thisPong,
 			})
@@ -1871,7 +1879,7 @@ func (de *endpoint) resetLocked() {
 		}
 	}
 	de.probeUDPLifetime.resetCycleEndpointLocked()
-	de.c.relayManager.cancelOutstandingWork(de)
+	de.c.relayManager.stopWork(de)
 }
 
 func (de *endpoint) numStopAndReset() int64 {

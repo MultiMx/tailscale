@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"tailscale.com/disco"
+	"tailscale.com/types/key"
 )
 
 func TestRelayManagerInitAndIdle(t *testing.T) {
@@ -16,14 +17,14 @@ func TestRelayManagerInitAndIdle(t *testing.T) {
 	<-rm.runLoopStoppedCh
 
 	rm = relayManager{}
-	rm.cancelOutstandingWork(&endpoint{})
+	rm.stopWork(&endpoint{})
 	<-rm.runLoopStoppedCh
 
 	rm = relayManager{}
-	rm.handleCallMeMaybeVia(&disco.CallMeMaybeVia{})
+	rm.handleCallMeMaybeVia(&endpoint{c: &Conn{discoPrivate: key.NewDisco()}}, &disco.CallMeMaybeVia{ServerDisco: key.NewDisco().Public()})
 	<-rm.runLoopStoppedCh
 
 	rm = relayManager{}
-	rm.handleBindUDPRelayEndpointChallenge(&disco.BindUDPRelayEndpointChallenge{}, &discoInfo{}, netip.AddrPort{}, 0)
+	rm.handleGeneveEncapDiscoMsgNotBestAddr(&disco.BindUDPRelayEndpointChallenge{}, &discoInfo{}, netip.AddrPort{}, 0)
 	<-rm.runLoopStoppedCh
 }

@@ -64,7 +64,6 @@ import (
 	"tailscale.com/logpolicy"
 	"tailscale.com/net/captivedetection"
 	"tailscale.com/net/dns"
-	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/ipset"
@@ -237,6 +236,8 @@ type LocalBackend struct {
 	// goTracker accounts for all goroutines started by LocalBacked, primarily
 	// for testing and graceful shutdown purposes.
 	goTracker goroutines.Tracker
+
+	startOnce sync.Once // protects the one‑time initialization in [LocalBackend.Start]
 
 	// extHost is the bridge between [LocalBackend] and the registered [ipnext.Extension]s.
 	// It may be nil in tests that use direct composite literal initialization of [LocalBackend]
@@ -569,8 +570,6 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 			}
 		}
 	}
-
-	b.extHost.Init()
 	return b, nil
 }
 
@@ -934,11 +933,15 @@ func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 	}
 }
 
-func (b *LocalBackend) onHealthChange(w *health.Warnable, us *health.UnhealthyState) {
-	if us == nil {
-		b.logf("health(warnable=%s): ok", w.Code)
-	} else {
-		b.logf("health(warnable=%s): error: %s", w.Code, us.Text)
+func (b *LocalBackend) onHealthChange(change health.Change) {
+	if change.WarnableChanged {
+		w := change.Warnable
+		us := change.UnhealthyState
+		if us == nil {
+			b.logf("health(warnable=%s): ok", w.Code)
+		} else {
+			b.logf("health(warnable=%s): error: %s", w.Code, us.Text)
+		}
 	}
 
 	// Whenever health changes, send the current health state to the frontend.
@@ -2163,6 +2166,11 @@ func (b *LocalBackend) getNewControlClientFuncLocked() clientGen {
 	return b.ccGen
 }
 
+// initOnce is called on the first call to [LocalBackend.Start].
+func (b *LocalBackend) initOnce() {
+	b.extHost.Init()
+}
+
 // Start applies the configuration specified in opts, and starts the
 // state machine.
 //
@@ -2175,6 +2183,8 @@ func (b *LocalBackend) getNewControlClientFuncLocked() clientGen {
 // from the following whether or not that is a safe transition).
 func (b *LocalBackend) Start(opts ipn.Options) error {
 	b.logf("Start")
+
+	b.startOnce.Do(b.initOnce)
 
 	var clientToShutdown controlclient.Client
 	defer func() {
@@ -4844,12 +4854,6 @@ func (b *LocalBackend) authReconfig() {
 	}
 	b.logf("[v1] authReconfig: ra=%v dns=%v 0x%02x: %v", prefs.RouteAll(), prefs.CorpDNS(), flags, err)
 
-	if resolver.ShouldUseRoutes(b.ControlKnobs()) {
-		b.dialer.SetRoutes(rcfg.Routes, rcfg.LocalRoutes)
-	} else {
-		b.dialer.SetRoutes(nil, nil)
-	}
-
 	b.initPeerAPIListener()
 	b.readvertiseAppConnectorRoutes()
 }
@@ -5826,7 +5830,7 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	b.pauseOrResumeControlClientLocked()
 
 	if nm != nil {
-		b.health.SetControlHealth(nm.ControlHealth)
+		b.health.SetControlHealth(nm.DisplayMessages)
 	} else {
 		b.health.SetControlHealth(nil)
 	}
